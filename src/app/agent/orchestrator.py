@@ -28,6 +28,7 @@ from app.agent.llm_assist import (
     rerank_proactive,
 )
 from app.agent.rag_retriever import (
+    fetch_patient_phrase_universe,
     RetrievalSource,
     RetrievedCandidate,
     _nfc,
@@ -175,26 +176,36 @@ async def _handle_high(
             # SET LOCAL이 rollback으로 사라지므로 복구
             await session.execute(text("SET LOCAL ivfflat.probes = 2"))
 
-    # C3 — cold-start 高에서 retrieved 비면 time_tags 기반 catalog phrase inject.
-    # verbatim과 동일 phrase는 제외 (설계상 suggestion은 verbatim과 달라야 함).
+    # Cold-start 高: retrieved 비면 time_tags 기반 catalog phrase inject.
+    # verbatim과 동일 phrase는 제외.
     if cold_start and not retrieved:
-        tb_phrases = fallback_candidates(time_bucket, limit=3)
+        tb_phrases = fallback_candidates(time_bucket, limit=8)
         retrieved = [
             RetrievedCandidate(phrase=_nfc(p), sources=[RetrievalSource.CATALOG_COLD_START])
             for p in tb_phrases if _nfc(p) != _nfc(ml_text)
         ]
 
-    # allowed_set = retrieved ∪ 환자 최근 history. history는 LLM 입력으로 들어가므로
-    # 가드 집합에도 포함해야 함 (가드/프롬프트 일관성). verbatim 중복은 llm_assist의
-    # verbatim-skip 가드가 별도 처리.
-    allowed_set: set[str] = {c.phrase for c in retrieved} | {_nfc(h) for h in history if h}
+    # allowed_set = retrieved ∪ history ∪ 환자 전체 발화 universe (180일).
+    # universe는 LLM 입력엔 안 들어가고 가드만 완화 — history 10개에 밀려난
+    # 환자 선호 phrase도 통과시킴. verbatim 중복은 llm_assist의 verbatim-skip 가드가 처리.
+    universe = await fetch_patient_phrase_universe(session, patient_id)
+    allowed_set: set[str] = (
+        {c.phrase for c in retrieved}
+        | {_nfc(h) for h in history if h}
+        | universe
+    )
 
-    # 3. LLM 호출
+    retrieved_as_dicts = [
+        {"phrase": c.phrase, "cosine_sim": getattr(c, "cosine_sim", 0.0)}
+        for c in retrieved
+    ]
+
     llm_result: LLMResult = await rerank_proactive(
         verbatim=ml_text,
         patient_history=history,
         time_bucket=time_bucket,
         prefs_meta=prefs_meta,
+        retrieved_candidates=retrieved_as_dicts,
         allowed_set=allowed_set,
     )
 
@@ -265,12 +276,14 @@ async def _handle_mid(
             await session.rollback()
             await session.execute(text("SET LOCAL ivfflat.probes = 2"))
 
-    # allowed_set = verbatim ∪ retrieved ∪ history. 中은 verbatim(rank 1) 포함 OK.
+    # allowed_set = verbatim ∪ retrieved ∪ history ∪ universe.
     ml_nfc = _nfc(ml_text) if ml_text else ""
+    universe = await fetch_patient_phrase_universe(session, patient_id)
     allowed_set: set[str] = (
         ({ml_nfc} if ml_nfc else set())
         | {c.phrase for c in retrieved}
         | {_nfc(h) for h in history if h}
+        | universe
     )
 
     # 4. retrieved → dicts for LLM
@@ -418,8 +431,13 @@ async def _handle_low(
             await session.rollback()
             await session.execute(text("SET LOCAL ivfflat.probes = 2"))
 
-    # allowed_set = retrieved ∪ history. ml_text는 구조적으로 제외 (低 분기 설계).
-    allowed_set: set[str] = {c.phrase for c in retrieved} | {_nfc(h) for h in history if h}
+    # allowed_set = retrieved ∪ history ∪ universe. ml_text는 구조적 제외 (低 분기 설계).
+    universe = await fetch_patient_phrase_universe(session, patient_id)
+    allowed_set: set[str] = (
+        {c.phrase for c in retrieved}
+        | {_nfc(h) for h in history if h}
+        | universe
+    )
 
     # 3. retrieved → dicts for LLM
     retrieved_as_dicts = [
