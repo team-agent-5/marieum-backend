@@ -1,0 +1,35 @@
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    container_name: aac-db
+    restart: unless-stopped          # 서버 리부팅·크래시 시 자동 복구
+    environment:
+      POSTGRES_USER: aac
+      POSTGRES_PASSWORD: aac
+      POSTGRES_DB: aac
+      # 로그/쿼리 표시용 KST (저장은 timestamptz 로 UTC 유지).
+      # 집계는 generated column 에서 명시적 AT TIME ZONE 'Asia/Seoul' 사용 — 영향 없음.
+      TZ: Asia/Seoul
+      PGTZ: Asia/Seoul
+    ports:
+      # 127.0.0.1 바인딩: 호스트 내부(서버에서 돌리는 FastAPI)에서만 접근.
+      # 외부에서 psql 디버깅 필요 시 SSH 터널 사용:
+      #   ssh -L 15432:localhost:5432 ncloud@10.1.1.11
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - aac-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U aac -d aac"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s              # 첫 기동 시 유예 시간
+    shm_size: 256mb                  # Postgres sort/hash 성능
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  aac-pgdata:
