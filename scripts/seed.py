@@ -30,34 +30,41 @@ from app.models import Patient, PatientPreference, PhraseCatalog, PhraseLog
 from app.security import hash_password
 from app.services.embedding import embed_batch, embed_text
 
-# ────────── Catalog (25 phrases) ──────────
+# ────────── Catalog (25 phrases with time_tags) ──────────
+# time_tags: 각 phrase가 자연스럽게 요청되는 시간대 (의료·돌봄 context)
+# bucket 정의: morning=06-11, afternoon=12-17, evening=18-22, night=23-05 (KST)
 
-CATALOG_PHRASES: list[str] = [
-    "물 주세요",
-    "화장실 가고 싶어요",
-    "배가 아파요",
-    "머리가 아파요",
-    "약 주세요",
-    "미지근한 물 주세요",
-    "뜨거운 물 주세요",
-    "조금만 주세요",
-    "많이 주세요",
-    "밥 먹을래요",
-    "죽 먹을래요",
-    "국 더 주세요",
-    "불 꺼주세요",
-    "불 켜주세요",
-    "창문 열어주세요",
-    "창문 닫아주세요",
-    "텔레비전 켜주세요",
-    "텔레비전 꺼주세요",
-    "조용히 해주세요",
-    "말 걸어 주세요",
-    "손 좀 잡아주세요",
-    "일으켜 주세요",
-    "앉혀 주세요",
-    "담요 덮어 주세요",
-    "선풍기 틀어 주세요",
+CATALOG_PHRASES: list[tuple[str, list[str]]] = [
+    # 음료
+    ("물 주세요",             ["morning", "afternoon", "evening", "night"]),   # 하루종일
+    ("화장실 가고 싶어요",    ["morning", "afternoon", "evening", "night"]),   # 하루종일
+    ("배가 아파요",           ["morning", "afternoon", "evening", "night"]),   # 하루종일
+    ("머리가 아파요",         ["morning", "afternoon", "evening", "night"]),   # 하루종일
+    ("약 주세요",             ["morning", "night"]),                           # 복약 시간
+    ("미지근한 물 주세요",    ["evening", "night"]),                           # 저녁·야간 선호
+    ("뜨거운 물 주세요",      ["morning", "night"]),                           # 아침·야간
+    ("조금만 주세요",         ["morning", "afternoon", "evening"]),            # 식사 시간대
+    ("많이 주세요",           ["morning", "afternoon", "evening"]),            # 식사 시간대
+    # 식사
+    ("밥 먹을래요",           ["morning", "afternoon", "evening"]),            # 3끼
+    ("죽 먹을래요",           ["morning", "evening"]),                         # 아침·저녁 죽
+    ("국 더 주세요",          ["morning", "afternoon", "evening"]),            # 식사 중
+    # 환경·조명
+    ("불 꺼주세요",           ["night"]),                                      # 취침 전
+    ("불 켜주세요",           ["morning"]),                                    # 기상 후
+    ("창문 열어주세요",       ["morning", "afternoon"]),                       # 낮 환기
+    ("창문 닫아주세요",       ["evening", "night"]),                           # 저녁·야간
+    ("텔레비전 켜주세요",     ["afternoon", "evening"]),                       # 여가 시간
+    ("텔레비전 꺼주세요",     ["night"]),                                      # 취침 전
+    # 소통·감정
+    ("조용히 해주세요",       ["afternoon", "night"]),                         # 낮잠·취침
+    ("말 걸어 주세요",        ["morning", "afternoon"]),                       # 낮 시간 소통
+    ("손 좀 잡아주세요",      ["evening", "night"]),                           # 저녁·야간 불안
+    # 자세·이동
+    ("일으켜 주세요",         ["morning"]),                                    # 기상 후 기립
+    ("앉혀 주세요",           ["morning", "afternoon"]),                       # 낮 활동
+    ("담요 덮어 주세요",      ["evening", "night"]),                           # 취침 준비
+    ("선풍기 틀어 주세요",    ["afternoon"]),                                  # 오후 더위
 ]
 
 # ────────── Demo patients ──────────
@@ -94,26 +101,45 @@ DEMO_PATIENTS = [
 
 
 async def seed_catalog(session) -> None:
-    existing_texts = {
-        r.text
-        for r in (await session.execute(select(PhraseCatalog))).scalars().all()
-    }
-    todo = [p for p in CATALOG_PHRASES if p not in existing_texts]
-    if not todo:
-        print(f"catalog already seeded ({len(existing_texts)} rows)")
-        return
-    vecs = await embed_batch(todo)
-    for phrase, vec in zip(todo, vecs, strict=True):
-        session.add(
-            PhraseCatalog(
-                text=phrase,
-                category="general",
-                embedding=vec,
-                source="manual",
+    # Build lookup: text -> time_tags from CATALOG_PHRASES
+    tags_by_text: dict[str, list[str]] = {text: tags for text, tags in CATALOG_PHRASES}
+
+    existing_rows: list[PhraseCatalog] = (
+        await session.execute(select(PhraseCatalog))
+    ).scalars().all()
+    existing_texts = {r.text for r in existing_rows}
+
+    new_phrases = [text for text, _tags in CATALOG_PHRASES if text not in existing_texts]
+
+    # ── Insert new phrases ────────────────────────────────────────────────────
+    if new_phrases:
+        vecs = await embed_batch(new_phrases)
+        for phrase, vec in zip(new_phrases, vecs, strict=True):
+            session.add(
+                PhraseCatalog(
+                    text=phrase,
+                    category="general",
+                    embedding=vec,
+                    source="manual",
+                    time_tags=tags_by_text[phrase],
+                )
             )
-        )
-    await session.commit()
-    print(f"catalog seeded: {len(todo)} new rows (total {len(existing_texts) + len(todo)})")
+        await session.commit()
+        print(f"catalog seeded: {len(new_phrases)} new rows")
+    else:
+        print(f"catalog already seeded ({len(existing_texts)} rows)")
+
+    # ── Backfill time_tags on existing rows that still have empty array ───────
+    backfilled = 0
+    for row in existing_rows:
+        if not row.time_tags and row.text in tags_by_text:
+            row.time_tags = tags_by_text[row.text]
+            backfilled += 1
+    if backfilled:
+        await session.commit()
+        print(f"catalog time_tags backfilled: {backfilled} rows updated")
+    else:
+        print("catalog time_tags: all existing rows already tagged")
 
 
 async def seed_patients(session) -> dict[str, Patient]:

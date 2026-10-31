@@ -1,14 +1,11 @@
 """Phrase 라우터 (v4) — HTTP 발화 흐름.
 
 - transcribe: 멀티파트 오디오 → ASR 전사 (M4·M5, WS 대체)
-- suggest: 추천 후보 3개 (agent 플레이스홀더)
+- suggest: 추천 후보 (accuracy-mode orchestrator — D2)
 - selection: 환자 선택·거부 로그
 - preset: 빠른 문장 10개 즉시 로그
 - bypass: 실시간 모드 ASR final 즉시 로그
 - history: 발화 히스토리
-
-**agent 실제 ranking 로직은 미구현** — mock 응답 반환. ranking engine 작성 시
-`app/agent/ranker.py`로 분리 예정.
 """
 
 from __future__ import annotations
@@ -34,6 +31,7 @@ from fastapi import (
 from sqlalchemy import and_, desc, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.agent.orchestrator import suggest as orchestrator_suggest
 from app.audit import audit_append
 from app.db import get_session
 from app.middleware import get_trace_id
@@ -52,14 +50,7 @@ from app.schemas import (
     TranscribeResponse,
 )
 from app.schemas_v2 import (
-    CandidatesModeResponse,
-    CandidateV2,
-    ProactiveModeResponse,
-    ProactiveSuggestion,
-    RetryModeResponse,
-    SingleModeResponse,
     SuggestResponseV2,
-    VerbatimPhrase,
 )
 from app.security import require_patient
 from app.services.embedding import embed_text
@@ -200,15 +191,14 @@ def _map_candidate_source_to_db(source: str | None) -> str:
 @router.post(
     "/suggest",
     response_model=SuggestResponseV2,
-    summary="후보 추천 (v2, mode별 shape) — D1 mock 응답, D2+에서 LLM 결선",
+    summary="후보 추천 (v2, mode별 shape) — accuracy-mode orchestrator (D2)",
     description=(
-        "**D1 accuracy-mode mock**: LLM/ranker 호출 없이 asr_confidence 기반으로 "
-        "4분기(proactive/candidates/single/retry) 중 하나를 즉시 반환.\n\n"
+        "**D2 accuracy-mode**: RAG + LLM + 3-level fallback chain.\n\n"
         "- `mode=proactive` (conf ≥ 0.98): verbatim 즉시 TTS + 선택적 LLM 제안 모달\n"
         "- `mode=candidates` (0.90 ≤ conf < 0.98): 3후보 선택 UI\n"
         "- `mode=single` (0.40 ≤ conf < 0.90): 단일 후보 큰 글자 UI\n"
         "- `mode=retry` (conf < 0.40): 재질의 안내 (200 OK, HTTP 422 아님)\n\n"
-        "프론트엔드는 `mode` 필드로 switch 분기. D2+에서 실제 LLM 로직 교체 예정."
+        "프론트엔드는 `mode` 필드로 switch 분기."
     ),
 )
 async def suggest(
@@ -217,126 +207,35 @@ async def suggest(
     me: Annotated[PatientPrincipal, Depends(require_patient)],
     session: Annotated[AsyncSession, Depends(get_session)],
 ) -> SuggestResponseV2:
-    """D1 mock — confidence 기반 4분기 응답. 실제 LLM/ranker 호출 없음.
+    """D2 orchestrator — RAG + LLM + fallback 체인.
 
     asr_confidence 미제공 시 1.0(high 분기)으로 처리 (D3 fallback).
-    retry 분기도 HTTP 422 대신 200 + RetryModeResponse 반환 (accuracy-mode UX 원칙).
+    모든 분기에서 HTTP 200 보장 (retry 포함).
     """
-    import time
-
-    from app.agent.confidence_router import classify_branch
-
-    t0 = time.perf_counter()
     trace_id = body.trace_id or get_trace_id(request)
-    now = datetime.now(UTC)
 
-    # D3 fallback: asr_confidence 미제공이면 1.0 (high 분기)으로 처리.
-    conf: float = body.asr_confidence if body.asr_confidence is not None else 1.0
-    branch = classify_branch(conf)
-
-    base_kwargs: dict = dict(
+    response = await orchestrator_suggest(
+        patient_id=me.patient_id,
+        ml_text=body.final_transcript or body.patient_prefix or "",
+        asr_confidence=body.asr_confidence,
         trace_id=trace_id,
-        asr_confidence=conf,
-        cold_start=False,  # D1 mock: 실제 phrase_log 집계 없음
-        generated_at=now,
+        session=session,
+        accuracy_mode=body.accuracy_mode if hasattr(body, "accuracy_mode") else True,
     )
 
-    # ── retry 분기 ──────────────────────────────────────────────────────────
-    if branch == "retry":
-        response: SuggestResponseV2 = RetryModeResponse(
-            mode="retry",
-            branch="retry",
-            message="잘 못 들었어요. 다시 말씀해 주세요.",
-            **base_kwargs,
-            generation_latency_ms=int((time.perf_counter() - t0) * 1000),
-        )
-
-    # ── high 분기 (proactive) ────────────────────────────────────────────
-    elif branch == "high":
-        verbatim_text = (body.final_transcript or body.patient_prefix or "").strip()
-        response = ProactiveModeResponse(
-            mode="proactive",
-            branch="high",
-            verbatim=VerbatimPhrase(text=verbatim_text),
-            suggestion=ProactiveSuggestion(
-                phrase="미지근한 물 주세요",
-                reason_display="저녁에 자주 요청하신 음료",
-                modal_text="미지근한 물 주세요라고 말할까요?",
-                confidence=0.86,
-            ),
-            **base_kwargs,
-            generation_latency_ms=int((time.perf_counter() - t0) * 1000),
-        )
-
-    # ── mid 분기 (candidates) ────────────────────────────────────────────
-    elif branch == "mid":
-        verbatim_text = (body.final_transcript or body.patient_prefix or "물 주세요").strip()
-        response = CandidatesModeResponse(
-            mode="candidates",
-            branch="mid",
-            candidates=[
-                CandidateV2(
-                    rank=1,
-                    text=verbatim_text,
-                    reason_label="verbatim",
-                    reason_display="방금 들린 그대로",
-                    score=None,
-                    source="asr_verbatim",
-                ),
-                CandidateV2(
-                    rank=2,
-                    text="미지근한 물 주세요",
-                    reason_label="time_context",
-                    reason_display="저녁에 자주 선택하신 말",
-                    score=None,
-                    source="llm_inference",
-                ),
-                CandidateV2(
-                    rank=3,
-                    text="따뜻한 물 주세요",
-                    reason_label="patient_frequency",
-                    reason_display="자주 쓰시는 패턴",
-                    score=None,
-                    source="llm_inference",
-                ),
-            ],
-            **base_kwargs,
-            generation_latency_ms=int((time.perf_counter() - t0) * 1000),
-        )
-
-    # ── low 분기 (single) ────────────────────────────────────────────────
-    else:  # branch == "low"
-        response = SingleModeResponse(
-            mode="single",
-            branch="low",
-            candidate=CandidateV2(
-                rank=1,
-                text="물 주세요",
-                reason_label="patient_frequency",
-                reason_display="이 시간대에 자주 요청하신 문장",
-                score=None,
-                source="llm_reconstruction",
-            ),
-            **base_kwargs,
-            generation_latency_ms=int((time.perf_counter() - t0) * 1000),
-        )
-
-    # ── audit log ────────────────────────────────────────────────────────
-    # D1 mock이라도 운영 로그 패턴 유지: event="candidates_generated"
+    # audit_log 기록
     await audit_append(
         session,
         trace_id=trace_id,
         patient_id=me.patient_id,
         event="candidates_generated",
         payload={
-            "patient_id": str(me.patient_id),
-            "prefix": body.patient_prefix,
-            "mode": branch,   # proactive/candidates/single/retry
-            "branch": branch,
-            "asr_confidence": conf,
-            "cold_start": False,
-            "mock": True,     # D1 식별자 — D2+에서 제거
-            "generation_latency_ms": response.generation_latency_ms,  # type: ignore[union-attr]
+            "mode": response.mode,
+            "branch": response.branch,
+            "asr_confidence": body.asr_confidence,
+            "cold_start": response.cold_start,
+            "fallback_reason": response.accuracy_fallback_reason,
+            "latency_ms": response.generation_latency_ms,
         },
     )
     await session.commit()
