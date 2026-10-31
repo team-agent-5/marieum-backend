@@ -22,15 +22,17 @@ from app.agent.confidence_router import (
 @pytest.mark.parametrize(
     "conf,expected",
     [
-        # retry 분기 — conf < 0.40
+        # retry 분기 — conf < 0.60 (ML 2026-11-01 반영: 0.40~0.60 도 99% 틀림)
         (0.0, "retry"),
         (0.1, "retry"),
         (0.39, "retry"),
-        (0.3999, "retry"),
-        # 경계 (0.40) — low 시작
-        (0.40, "low"),
-        (0.5, "low"),
+        (0.40, "retry"),
+        (0.5, "retry"),
+        (0.5999, "retry"),
+        # 경계 (0.60) — low 시작
+        (0.60, "low"),
         (0.7, "low"),
+        (0.8, "low"),
         (0.89, "low"),
         (0.8999, "low"),
         # 경계 (0.90) — mid 시작
