@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+build/
+dist/
+.venv/
+venv/
+.venv-test/
+.python-version
+
+# Env
+.env
+.env.local
+
+# IDE
+.vscode/
+.idea/
+
+# Logs & tmp
+*.log
+logs/
+tmp/
+.DS_Store
+
+# Audio samples (실수로 환자 음성 커밋 방지, §10.7)
+*.wav
+*.mp3
+*.m4a
+*.webm
+!tests/fixtures/*.wav
+
+# ML artifacts
+.cache/
+models/
+
+# DB
+*.db
+*.sqlite
+
+# 설계·기획·운영 문서 (레포 외 관리, 내부 공유)
+_design/
+docs/

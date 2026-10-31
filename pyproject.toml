@@ -1,0 +1,96 @@
+[project]
+name = "aac-backend"
+version = "0.1.0"
+description = "구음장애 환자용 AI 음성 보조 + 돌봄 행동 추천 백엔드"
+requires-python = ">=3.11"
+dependencies = [
+    # Web
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+    "sse-starlette>=2.1",
+    "python-multipart>=0.0.12",
+
+    # DB
+    "sqlalchemy[asyncio]>=2.0",
+    "asyncpg>=0.29",
+    "alembic>=1.13",
+    "pgvector>=0.3",
+
+    # LLM / Embedding / HTTP
+    "openai>=1.50",            # Groq OpenAI-compatible endpoint
+    "sentence-transformers>=3.0",
+    "httpx>=0.27",
+
+    # Config
+    "pydantic>=2.9",
+    "pydantic-ai-slim[anthropic]>=2.64.0,<3",  # accuracy mode (Sonnet 4.5)
+    "pydantic-ai-slim[groq]>=2.64.0,<3",       # LEGACY — remove in D2 cleanup
+    "pydantic-settings>=2.5",
+    "python-dotenv>=1.0",
+
+    # Auth
+    "pyjwt>=2.9",
+
+    # Audio (optional helpers)
+    "numpy>=1.26",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "ruff>=0.6",
+    "ipython>=8.27",
+]
+rag-ingest = [
+    "pypdf>=5.0",              # PDF chunk용 (임상 가이드 ingest)
+    "tiktoken>=0.8",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W", "UP", "N", "B", "SIM", "RUF", "TID"]
+ignore = [
+    "E501",   # line too long (black/formatter에 맡김)
+    "B008",   # FastAPI Depends/Query/File default — 라우터 패턴상 불가피
+    "N806",   # 변수명 — Pydantic 모델 호환
+    "SIM108", # ternary — 가독성 떨어지는 경우 많음
+    "RUF012", # mutable class attrs
+]
+
+[tool.ruff.lint.per-file-ignores]
+"alembic/versions/*.py" = ["ALL"]  # 자동 생성 파일
+"scripts/*.py"           = ["F401"]  # 샘플 스크립트
+# streaming·ranking 패키지 자기 자신 import는 허용 (TID251 ignore).
+# 상호 격리는 pytest AST 테스트(`tests/test_isolation.py`, Phase B3)로 2중 방어.
+"src/app/agent/ranking/*.py"   = ["TID251"]
+"src/app/agent/streaming/*.py" = ["TID251"]
+# main.py는 양쪽 agent 패키지를 라우터로 등록하는 엔트리포인트이므로 TID251 면제.
+# 상호 격리 조건(streaming ↔ ranking)은 test_isolation.py AST 테스트로 보장.
+"src/app/main.py"              = ["TID251"]
+# 실시간 모듈을 직접 검증하는 테스트는 import 격리 대상이 아님.
+"tests/test_streaming*.py"       = ["TID251"]
+"tests/test_ml_proxy.py"         = ["TID251"]
+
+[tool.ruff.lint.flake8-tidy-imports.banned-api]
+# agent/streaming → agent/ranking import 금지
+# (반대 방향도 동일 규칙: agent/ranking → agent/streaming import 금지)
+# 두 방향 모두 전역 banned-api로 선언하고, per-file-ignores로 역방향만 면제하지 않음
+# → 어느 파일에서든 이 두 모듈을 import하면 TID251 오류 발생
+# → 단, 패키지 자기 자신(app.agent.ranking, app.agent.streaming) __init__ 내부 import는
+#   ruff가 같은 패키지 relative import로 처리하므로 실질적 충돌 없음
+"app.agent.ranking" = {msg = "agent/streaming은 ranking agent를 import할 수 없습니다 (격리 조건). 공유 로직은 app.services 또는 app.common을 사용하세요."}
+"app.agent.streaming" = {msg = "agent/ranking은 streaming agent를 import할 수 없습니다 (격리 조건). 공유 로직은 app.services 또는 app.common을 사용하세요."}
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/app"]

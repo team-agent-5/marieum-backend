@@ -1,0 +1,16 @@
+[
+  {"id": "clear_typo", "input": "믈 좀 주세여", "accepted": ["물 좀 주세요"]},
+  {"id": "valid_command", "input": "문 열어", "accepted": ["문 열어"]},
+  {"id": "valid_action", "input": "이제 내려", "accepted": ["이제 내려"]},
+  {"id": "negation", "input": "물은 안 마실래요", "accepted": ["물은 안 마실래요"]},
+  {"id": "negative_symptom", "input": "안 아파요", "accepted": ["안 아파요"]},
+  {"id": "time_and_quantity", "input": "세 시에 두 개 주세요", "accepted": ["세 시에 두 개 주세요"]},
+  {"id": "subject_and_action", "input": "엄마가 노래해", "accepted": ["엄마가 노래해"]},
+  {"id": "ambiguous_word", "input": "햄", "accepted": ["햄"]},
+  {"id": "ambiguous_asr", "input": "미식은 한 물 주세요", "accepted": ["미식은 한 물 주세요"]},
+  {"id": "unfinished_utterance", "input": "물 좀", "accepted": ["물 좀"]},
+  {"id": "emergency_negation", "input": "숨이 안 쉬어져요", "accepted": ["숨이 안 쉬어져요"]},
+  {"id": "name_and_prohibition", "input": "민수한테 물 주지 마", "accepted": ["민수한테 물 주지 마"]},
+  {"id": "preference_in_current_utterance", "input": "따뜻한 물 말고 찬물 주세요", "accepted": ["따뜻한 물 말고 찬물 주세요"]},
+  {"id": "valid_phrase", "input": "내일 만나", "accepted": ["내일 만나"]}
+]
