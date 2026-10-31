@@ -77,6 +77,7 @@ class PhraseCatalog(Base):
     category: Mapped[str | None] = mapped_column(String(32), nullable=True)        # 일반/요청/감정/응답 등
     embedding: Mapped[list[float]] = mapped_column(Vector(768))
     source: Mapped[str] = mapped_column(String(16), default="manual")              # manual/zeroth/self-recorded
+    time_tags: Mapped[list[str]] = mapped_column(ARRAY(Text), default=list)        # morning|afternoon|evening|night
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 

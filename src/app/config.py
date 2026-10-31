@@ -29,20 +29,19 @@ class Settings(BaseSettings):
     groq_model: str = "llama-3.3-70b-versatile"
     groq_timeout_sec: float = 1.5
 
-    # 실시간 교정 (Anthropic Haiku): 현재 발화만 전달, 개인 문맥 미사용
+    # 실시간 교정 (Anthropic Haiku via copa proxy): 현재 발화만 전달, 개인 문맥 미사용
+    # copa proxy가 받는 모델 ID는 단축형(`claude-haiku-4`). dated snapshot 미지원.
     anthropic_api_key: str = Field(default="", repr=False)
-    anthropic_base_url: str = "https://api.anthropic.com"
-    anthropic_model: str = "claude-haiku-4-5-20251001"
+    anthropic_base_url: str = "https://copa.codyssey.kr"
+    anthropic_model: str = "claude-haiku-4"
     anthropic_timeout_sec: float = Field(default=1.5, gt=0)
     streaming_llm_enabled: bool = Field(default=True, validation_alias="MARIEUM_STREAMING_LLM_ENABLED")
 
-    # Anthropic (Claude) — accuracy mode agent
-    # Reuses ANTHROPIC_API_KEY for unified key management; copa proxy for consistent routing.
-    # NOTE: 'claude-sonnet-4-5' alias는 프록시 라우팅 실패 가능.
-    # 운영자가 `curl -s https://copa.codyssey.kr/v1/models | jq '.data[].id'`
-    # 로 proxy가 받는 model ID 리스트 확인 필수.
-    accuracy_anthropic_model: str = "claude-sonnet-4-5-20250929"  # dated snapshot (safer than alias)
-    accuracy_anthropic_base_url: str = "https://copa.codyssey.kr/v1"  # proxy (unified with streaming)
+    # Anthropic (Claude) — accuracy mode agent (Sonnet via copa proxy)
+    # Reuses ANTHROPIC_API_KEY for unified key management.
+    # 모델 ID는 단축형(`claude-sonnet-4`). proxy가 dated snapshot alias 미지원.
+    accuracy_anthropic_model: str = "claude-sonnet-4"
+    accuracy_anthropic_base_url: str = "https://copa.codyssey.kr"  # SDK가 /v1/messages 자동 부착
     accuracy_anthropic_timeout_sec: float = Field(default=1.5, gt=0)
 
     # Embedding
