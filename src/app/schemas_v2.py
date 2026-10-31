@@ -51,6 +51,26 @@ class VerbatimPhrase(BaseModel):
     )
 
 
+class MLHeardPhrase(BaseModel):
+    """低 분기(0.40 ≤ conf < 0.90) ASR이 들은 그대로. 신뢰도 낮지만 환자가
+    과거에 쓴 적 없는 새 발화라면 유일한 단서. UI는 reconstruct candidate와
+    함께 선택지로 노출한다 (환자/간호사가 상황 판단).
+    """
+
+    text: str = Field(description="ASR final_transcript 원문. 신뢰도 낮음.")
+    confidence: float = Field(
+        ge=0.0, le=1.0, description="ASR confidence (0.40~0.90)."
+    )
+    source: Literal["ml_heard"] = Field(
+        default="ml_heard",
+        description="항상 'ml_heard' 고정. 분기 검증용.",
+    )
+    note: str = Field(
+        default="들린 그대로 (신뢰도 낮음)",
+        description="환자/간호사에게 보여줄 안내 문구.",
+    )
+
+
 class ProactiveSuggestion(BaseModel):
     """고신뢰(高) 분기 LLM 제안 문장. 환자가 모달에서 수락하면 TTS 재생.
 
@@ -227,10 +247,11 @@ class CandidatesModeResponse(SuggestResponseV2Base):
 # ─────────── 低 분기 ───────────
 
 class SingleModeResponse(SuggestResponseV2Base):
-    """低 분기 (0.40 ≤ conf < 0.90) — AI 단일 후보.
+    """低 분기 (0.40 ≤ conf < 0.90) — AI 단일 후보 + ASR 들린 그대로.
 
-    ML verbatim은 서버에서 audit만 하고 응답에 포함하지 않는다.
-    프론트는 큰 글자 1개 UI로 렌더링 (터치 영역 넓게).
+    프론트는 2개 선택지로 렌더링: ml_heard(들린 거) / candidate(복원 추천).
+    구음장애 환자는 ASR 신뢰도가 늘 낮으므로 verbatim을 완전히 버리면 과거에
+    쓴 적 없는 새 발화를 할 수 없다. ml_heard로 "들린 대로 바로 쓰기" 경로를 열어둔다.
     """
 
     mode: Literal["single"] = Field(
@@ -240,6 +261,13 @@ class SingleModeResponse(SuggestResponseV2Base):
     branch: Literal["low"] = Field(
         default="low",
         description="confidence 分岐. 低 분기는 항상 'low'.",
+    )
+    ml_heard: MLHeardPhrase | None = Field(
+        default=None,
+        description=(
+            "ASR이 들은 그대로. ml_text가 비어있거나 noise(1자 이하)이면 null. "
+            "null이 아니면 UI에 candidate와 함께 2 선택지 노출."
+        ),
     )
     candidate: CandidateV2 = Field(
         description="LLM 재구성 단일 후보. fallback 시 ranker top-1. "
