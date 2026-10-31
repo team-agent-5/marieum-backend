@@ -154,6 +154,24 @@ async def _set_ivfflat_probes(session: AsyncSession) -> None:
     await session.execute(text("SET LOCAL ivfflat.probes = 2"))
 
 
+async def fetch_patient_phrase_universe(
+    session: AsyncSession, patient_id: UUID, days: int = 180
+) -> set[str]:
+    """환자가 과거에 발화한 모든 unique phrase (NFC 정규화). 할루시 가드 전용 — LLM 입력 X."""
+    rows = (await session.execute(
+        text("""
+            SELECT DISTINCT selected_phrase
+            FROM phrase_log
+            WHERE patient_id = :pid
+              AND deleted_at IS NULL
+              AND selected_phrase IS NOT NULL
+              AND created_at >= NOW() - make_interval(days => :days)
+        """),
+        {"pid": str(patient_id), "days": days},
+    )).all()
+    return {_nfc(r[0]) for r in rows if r[0]}
+
+
 async def _query_rejected_24h(session: AsyncSession, pid: UUID) -> dict[str, int]:
     """M4/H5/L7: 24h rejected phrase → count map."""
     rows = (
@@ -259,7 +277,7 @@ async def retrieve_for_high(
                     sources=[RetrievalSource.CATALOG_COLD_START],
                 )
             )
-            if len(candidates) >= 1:
+            if len(candidates) >= 5:
                 break
         return candidates
 
