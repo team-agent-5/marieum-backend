@@ -14,6 +14,8 @@ import base64
 import binascii
 import logging
 import uuid
+
+import httpx
 from datetime import UTC, datetime, timedelta
 from typing import Annotated
 
@@ -33,6 +35,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent.orchestrator import suggest as orchestrator_suggest
 from app.audit import audit_append
+from app.config import settings
 from app.db import get_session
 from app.middleware import get_trace_id
 from app.models import PhraseLog
@@ -123,10 +126,78 @@ async def transcribe(
 
     trace_id = get_trace_id(request) or str(uuid.uuid4())
 
-    # TODO(ML): 실제 ASR 서버 호출. 지금은 하드코딩 mock.
-    final_text = "물 좀 주세요"
-    confidence = 0.82
-    effective_duration = duration_ms if duration_ms is not None else 1800
+    # ML /asr forward — spec: POST {ml_asr_url}/asr, body=raw bytes, header=Content-Type+X-Trace-Id.
+    ml_model_version = ""
+    try:
+        async with httpx.AsyncClient(timeout=settings.ml_asr_timeout_sec) as client:
+            r = await client.post(
+                f"{settings.ml_asr_url}/asr",
+                content=data,
+                headers={"Content-Type": ctype, "X-Trace-Id": trace_id},
+            )
+    except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+        log.warning("ML /asr unreachable (%s)", type(exc).__name__)
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail={"error_code": "ML_UNAVAILABLE", "message": "ASR 서버에 연결할 수 없습니다."},
+        ) from exc
+    except httpx.ReadTimeout as exc:
+        log.warning("ML /asr read timeout")
+        raise HTTPException(
+            status_code=status.HTTP_504_GATEWAY_TIMEOUT,
+            detail={"error_code": "ASR_TIMEOUT", "message": "ASR 처리 시간이 초과됐습니다."},
+        ) from exc
+
+    if r.status_code != status.HTTP_200_OK:
+        try:
+            err = r.json()
+            ml_code = str(err.get("code", "INTERNAL"))
+            ml_msg = str(err.get("message", "ASR 오류"))
+        except Exception:
+            ml_code = "INTERNAL"
+            ml_msg = r.text[:200] or "ASR 오류"
+        log.warning("ML /asr error %d code=%s", r.status_code, ml_code)
+        # 상태 매핑: 413 그대로, 400/415는 INVALID_FORMAT, 503은 MODEL_UNAVAILABLE, 그 외 502.
+        if r.status_code == status.HTTP_413_REQUEST_ENTITY_TOO_LARGE:
+            raise HTTPException(
+                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                detail={"error_code": "AUDIO_TOO_LONG", "message": ml_msg},
+            )
+        if r.status_code in (status.HTTP_400_BAD_REQUEST, status.HTTP_415_UNSUPPORTED_MEDIA_TYPE):
+            raise HTTPException(
+                status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+                detail={"error_code": "INVALID_FORMAT", "message": ml_msg},
+            )
+        if r.status_code == status.HTTP_503_SERVICE_UNAVAILABLE:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail={"error_code": "MODEL_UNAVAILABLE", "message": ml_msg},
+            )
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail={"error_code": ml_code, "message": ml_msg},
+        )
+
+    try:
+        ml_resp = r.json()
+    except Exception as exc:
+        log.warning("ML /asr malformed response")
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail={"error_code": "ASR_MALFORMED", "message": "ASR 응답 파싱 실패."},
+        ) from exc
+
+    final_text = str(ml_resp.get("text", ""))
+    try:
+        confidence = float(ml_resp.get("confidence", 0.0))
+    except (TypeError, ValueError):
+        confidence = 0.0
+    ml_duration = ml_resp.get("duration_ms")
+    effective_duration = (
+        int(ml_duration) if ml_duration is not None
+        else (duration_ms if duration_ms is not None else 0)
+    )
+    ml_model_version = str(ml_resp.get("model_version", ""))
 
     await audit_append(
         session,
@@ -138,6 +209,7 @@ async def transcribe(
             "bytes": len(data),
             "content_type": ctype,
             "confidence": confidence,
+            "ml_model": ml_model_version,
         },
     )
     await session.commit()
@@ -147,7 +219,7 @@ async def transcribe(
         final_transcript=final_text,
         asr_confidence=confidence,
         duration_ms=effective_duration,
-        heard_text=final_text if confidence < _ASR_LOW_CONFIDENCE else None,
+        heard_text=final_text if (final_text and confidence < _ASR_LOW_CONFIDENCE) else None,
     )
 
 

@@ -18,7 +18,7 @@ class Settings(BaseSettings):
 
     # ASR (HTTP mock 서버, Backend가 멀티파트로 받은 오디오 forward)
     ml_asr_url: str = "http://localhost:9001"
-    ml_asr_timeout_sec: float = 3.0
+    ml_asr_timeout_sec: float = 15.0  # ML spec: 60초 파일 ~1.25s + 큐·네트워크 margin
     # ML ASR WebSocket URL (미설정 시 healthz에서 "down" 상태 반영)
     ml_asr_ws_url: str = Field(
         default="", validation_alias=AliasChoices("ML_ASR_WS_URL", "MARIEUM_ML_ASR_WS_URL")
