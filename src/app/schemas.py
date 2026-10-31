@@ -367,12 +367,12 @@ class CandidateSnapshot(BaseModel):
     `source`는 LLM 생성 후보 사후 감사용(§12.2 안전 보증).
     """
 
-    rank: int = Field(ge=1, le=3, description="노출 순위.")
+    rank: int | None = Field(default=None, ge=1, le=3, description="노출 순위. D2 agent single 모드는 null.")
     text: str = Field(description="노출된 후보 문장.")
-    score: float = Field(ge=0.0, le=1.0, description="ranking 점수.")
+    score: float | None = Field(default=None, ge=0.0, le=1.0, description="ranking 점수. D2 agent는 confidence 또는 null.")
     reason_label: ReasonLabel | None = Field(default=None, description="추천 근거 enum.")
     source: CandidateSource = Field(
-        description="후보 생성 소스. catalog·patient_log·llm_gen."
+        description="후보 생성 소스. catalog·patient_log·llm_gen·llm_*."
     )
 
 
@@ -405,9 +405,10 @@ class SelectionRequest(BaseModel):
         default=None,
         description="선택한 후보의 순위. action=selected 시 1·2·3. rejected 또는 fallback 시 null.",
     )
-    latency_ms: int = Field(
+    latency_ms: int | None = Field(
+        default=None,
         ge=0,
-        description="후보 노출 → 터치까지 ms. 평가 지표 '선택 완료 시간' 산출용.",
+        description="후보 노출 → 터치까지 ms. 평가 지표 '선택 완료 시간' 산출용. 미측정 시 null.",
     )
     source: Literal["voice", "fallback"] = Field(
         default="voice",
