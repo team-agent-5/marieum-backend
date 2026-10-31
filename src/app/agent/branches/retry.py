@@ -1,4 +1,4 @@
-"""재질의 분기 전략 (``conf < RETRY_CONFIDENCE``, 기본 0.40).
+"""재질의 분기 전략 (``conf < RETRY_CONFIDENCE``, 기본 0.60 — ML 보고서 2026-11-01 반영).
 
 **원칙**: ``api/phrase.py`` 가 422 ``ASR_LOW_CONFIDENCE`` 로 미리 차단하므로
 본 전략은 **원래 호출되지 않는다**.

@@ -52,8 +52,9 @@ class Settings(BaseSettings):
     retry_max_attempts: int = 3
 
     # Agent — Confidence 분기 임계값.
+    # ML 연구 결과(2026-11-01) 반영: 0.40~0.60 도 99% 틀림 → retry 상한 0.60 으로 상향.
     # 운영 중 튜닝 가능 — ML 분포 변동 시 env 로 override.
-    retry_confidence: float = 0.40  # env: RETRY_CONFIDENCE — 재질의 상한
+    retry_confidence: float = 0.60  # env: RETRY_CONFIDENCE — 재질의 상한
     low_upper: float = 0.90         # env: LOW_UPPER        — 저신뢰 상한 (중신뢰 시작)
     mid_upper: float = 0.98         # env: MID_UPPER        — 중신뢰 상한 (고신뢰 시작)
 

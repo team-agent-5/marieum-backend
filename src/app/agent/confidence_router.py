@@ -20,10 +20,10 @@ def classify_branch(asr_confidence: float | None) -> ConfidenceBranch:
         → ``asr_confidence`` 를 전달하지 않는 레거시 경로나
           ML 서버 응답 누락 시 안전하게 verbatim-only 로 동작.
 
-    경계 처리:
-        * ``conf < RETRY_CONFIDENCE (0.40)``                → ``"retry"``
-        * ``RETRY_CONFIDENCE ≤ conf < LOW_UPPER (0.90)``   → ``"low"``
-        * ``LOW_UPPER ≤ conf < MID_UPPER (0.98)``          → ``"mid"``
+    경계 처리 (ML 보고서 2026-11-01 반영):
+        * ``conf < RETRY_CONFIDENCE (0.60)``                → ``"retry"``
+        * ``RETRY_CONFIDENCE ≤ conf < LOW_UPPER (0.90)``    → ``"low"``
+        * ``LOW_UPPER ≤ conf < MID_UPPER (0.98)``           → ``"mid"``
         * ``conf ≥ MID_UPPER (0.98)``                       → ``"high"``
 
     1차 MVP 는 **안정화 밴드 없음** (D4, 리스크 R2 수용).
