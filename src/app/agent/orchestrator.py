@@ -39,6 +39,7 @@ from app.agent.rag_retriever import (
 from app.schemas_v2 import (
     CandidatesModeResponse,
     CandidateV2,
+    MLHeardPhrase,
     ProactiveModeResponse,
     ProactiveSuggestion,
     RetryModeResponse,
@@ -408,6 +409,7 @@ async def _handle_mid(
 async def _handle_low(
     session: AsyncSession,
     patient_id: UUID,
+    ml_text: str,
     time_bucket: str,
     cold_start: bool,
     history: list[str],
@@ -418,7 +420,18 @@ async def _handle_low(
     t0: float,
     previous_phrase: str | None = None,
 ) -> SingleModeResponse:
-    """低 분기 (0.40 ≤ conf < 0.90) — ML text 완전 무시, AI 단일 후보."""
+    """低 분기 (0.40 ≤ conf < 0.90) — AI 단일 후보 + ASR ml_heard.
+
+    ml_text는 LLM 입력엔 안 들어가지만 (구조적 블로킹 유지) 응답에는 ml_heard로 포함.
+    환자가 과거에 쓴 적 없는 새 발화일 때 유일한 단서를 UI에 넘긴다.
+    """
+    # ml_heard: 2자 이상이고 비어있지 않을 때만 노출 (1자 noise는 null)
+    ml_stripped = ml_text.strip() if ml_text else ""
+    ml_heard: MLHeardPhrase | None = (
+        MLHeardPhrase(text=ml_stripped, confidence=conf or 0.0)
+        if len(ml_stripped) >= 2 else None
+    )
+
     # 1. RAG retrieve_for_low (ML text 없이)
     try:
         retrieved = await retrieve_for_low(
@@ -468,6 +481,7 @@ async def _handle_low(
         return SingleModeResponse(
             mode="single",
             branch="low",
+            ml_heard=ml_heard,
             candidate=CandidateV2(
                 rank=1,
                 text=out.phrase,
@@ -488,6 +502,7 @@ async def _handle_low(
         return SingleModeResponse(
             mode="single",
             branch="low",
+            ml_heard=ml_heard,
             candidate=CandidateV2(
                 rank=1,
                 text=top.phrase,
@@ -506,6 +521,7 @@ async def _handle_low(
         return SingleModeResponse(
             mode="single",
             branch="low",
+            ml_heard=ml_heard,
             candidate=CandidateV2(
                 rank=1,
                 text=tb_phrases[0],
@@ -522,6 +538,7 @@ async def _handle_low(
     return SingleModeResponse(
         mode="single",
         branch="low",
+        ml_heard=ml_heard,
         candidate=CandidateV2(
             rank=1,
             text="다시 말씀해 주세요",
@@ -628,16 +645,22 @@ async def suggest(
 
         # branch == "low"
         return await _handle_low(
-            session, patient_id, time_bucket, cold_start,
+            session, patient_id, ml_text, time_bucket, cold_start,
             history, prefs_meta, trace_id, conf, now, t0,
         )
 
     except Exception as exc:
         # 최악 상황: 전체 fallback → "다시 말씀해 주세요"
         log.exception("orchestrator.suggest unhandled exception: %s", type(exc).__name__)
+        _ml_stripped_exc = ml_text.strip() if ml_text else ""
+        _ml_heard_exc = (
+            MLHeardPhrase(text=_ml_stripped_exc, confidence=conf or 0.0)
+            if len(_ml_stripped_exc) >= 2 else None
+        )
         return SingleModeResponse(
             mode="single",
             branch="low",
+            ml_heard=_ml_heard_exc,
             candidate=CandidateV2(
                 rank=1,
                 text="다시 말씀해 주세요",
