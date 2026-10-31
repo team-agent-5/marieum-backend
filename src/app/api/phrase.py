@@ -247,6 +247,11 @@ _SOURCE_TO_DB: dict[str, str] = {
     "llm_gen": "voice",
     # catalog seed 는 "fallback" 성격 (phrase_catalog 수동 fallback 과 동일).
     "catalog": "fallback",
+    # D2 accuracy-mode agent sources
+    "llm_reconstruction": "voice",   # 저신뢰 agent 복원 → 환자 선택 시 voice
+    "llm_inference": "voice",         # 중신뢰 agent 추론 → 환자 선택 시 voice
+    "catalog_fallback": "fallback",   # L2 time_based preset
+    "ranker_fallback": "voice",       # L1 ranker 결과
 }
 
 

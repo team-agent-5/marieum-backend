@@ -63,6 +63,11 @@ CandidateSource = Literal[
     "catalog",
     "patient_log",
     "llm_gen",
+    # D2 accuracy-mode agent sources
+    "llm_reconstruction",   # 저신뢰 single — history 기반 복원
+    "llm_inference",         # 중신뢰 candidates r2/r3 — LLM 추론
+    "catalog_fallback",      # L2 time_based preset
+    "ranker_fallback",       # L1 deterministic ranker
 ]
 """후보 생성 소스. LLM 자유 생성 사후 감사용(§12.2 안전 보증).
 
