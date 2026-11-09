@@ -639,12 +639,19 @@ async def history(
         )
 
     stmt = (
-        select(PhraseLog)
+        select(
+            PhraseLog.id,
+            PhraseLog.selected_phrase,
+            PhraseLog.final_transcript,
+            PhraseLog.source,
+            PhraseLog.selected_rank,
+            PhraseLog.created_at,
+        )
         .where(*conditions)
         .order_by(desc(PhraseLog.created_at), desc(PhraseLog.id))
         .limit(limit + 1)
     )
-    rows = list((await session.execute(stmt)).scalars().all())
+    rows = list((await session.execute(stmt)).all())
 
     has_more = len(rows) > limit
     page_rows = rows[:limit]
