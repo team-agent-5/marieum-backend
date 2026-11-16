@@ -4,13 +4,13 @@ phrase_log 에 `action='rejected'` 로 쌓인 24h 내 로그를 **음수 penalty
 `RankingContext` 에 해당 필드가 **없을 수도 있다** — getattr 로 defensive 하게 접근한다.
 
 공식 (사용자 지침 — 간이화):
-    penalty(phrase) = Σ (-0.15 × exp(-ln2 × hours_ago_i / 24))
+    penalty(phrase) = Σ (-0.15 x exp(-ln2 x hours_ago_i / 24))
                        for each rejected_log_i WHERE phrase_i == phrase
     penalty_clip    = max(-0.5, penalty(phrase))   # 누적 상한 (하한 -0.5)
     반환은 **음수 또는 0** — ranker 가중합에서 `base + rejected_penalty` 로 더해진다.
 
 NOTE: 원문 수식은 F1/F2 를 **곱셈 감쇠** (`s_f1 * (1 - rejected_signal)`) 하지만,
-사용자 지침은 "선형 -0.15 × decay 를 가중합에 **add**" 로 간이화한다 — 1차 MVP 범위.
+사용자 지침은 "선형 -0.15 x decay 를 가중합에 **add**" 로 간이화한다 — 1차 MVP 범위.
 F1/F2 감쇠 방식으로 재조정할 여지 있음 (`FeatureScores.rejected_penalty` 필드만 유지하면 호환).
 
 사용자 지침 "24h 이내 3회 이상 거부 → blacklist 플래그" 는 **본 모듈에서 미구현** —
@@ -19,8 +19,8 @@ Q (결정 보류) 상태이므로 주석만 남긴다.
 from __future__ import annotations
 
 import math
+from collections.abc import Iterable
 from datetime import UTC, datetime
-from typing import Iterable
 
 # -----------------------------------------------------------------------------
 # 상수 — 사용자 지침 명시 값
@@ -35,6 +35,10 @@ PENALTY_PER_REJECT = 0.15
 HALF_LIFE_HOURS = 24.0
 # 누적 penalty 하한 (음수 방향 최대값, 즉 반환값은 >= -CUMULATIVE_FLOOR 반대 부호).
 CUMULATIVE_FLOOR = 0.5
+# 콜드 유저 confidence smoothing 상수 (Beta-binomial smoothing).
+# confidence = freq_total / (freq_total + K)
+# K=5 → freq_total=5 에서 confidence=0.5 (약 1-2일 사용자 경계).
+COLD_START_K = 5
 
 # TODO: context.py 보강 — `RankingContext` 에 아래 필드를 추가해야 완전한 집계가 가능하다.
 #   `RankingContext` 에 아래 필드를 추가해야 완전한 집계가 가능하다.
@@ -115,7 +119,7 @@ def compute(cand: object, ctx: object) -> float:  # type: ignore[override]
     """해당 phrase 의 rejected penalty 계산.
 
     공식:
-        penalty = Σ (-PENALTY_PER_REJECT × exp_decay(hours_since_reject_i))   (24h 내 로그)
+        penalty = Σ (-PENALTY_PER_REJECT x exp_decay(hours_since_reject_i))   (24h 내 로그)
         clip    = max(-CUMULATIVE_FLOOR, penalty)
         → 반환은 **음수 또는 0** (ranker 가중합에서 `base` 에 add).
 
@@ -131,17 +135,23 @@ def compute(cand: object, ctx: object) -> float:  # type: ignore[override]
     if rejected_counts is None:
         return 0.0
 
+    # 콜드 유저 confidence: 이력이 적을수록 거부 신호를 신뢰하지 않음.
+    # freq_total=0(신규) → confidence=0, freq_total=K → 0.5, 충분히 크면 ≈1.
+    freq_total = max(0, getattr(ctx, "freq_total", 0))
+    confidence = freq_total / (freq_total + COLD_START_K)
+
     total = 0.0
     for reject_ts, multiplicity in _iter_rejects(rejected_counts, phrase):
         hours = _hours_between(now, reject_ts)
-        if hours > HALF_LIFE_HOURS * 24:  # 24h 창 보호 (half_life 가 아니라 실제 창 24h)
-            # 실제 창은 24h — 반감기와 동일. 과도한 과거는 context.py 에서 자르는 게 정석.
+        if hours > HALF_LIFE_HOURS * 24:  # 24h 창 보호
             continue
         total += -PENALTY_PER_REJECT * exp_decay(hours) * max(1, multiplicity)
 
-    # 누적 상한 (음수 방향).
-    if total < -CUMULATIVE_FLOOR:
-        total = -CUMULATIVE_FLOOR
+    # confidence 스케일 적용 — 패널티와 floor 모두 비례.
+    total *= confidence
+    effective_floor = -CUMULATIVE_FLOOR * confidence
+    if total < effective_floor:
+        total = effective_floor
 
     # 양수 방어 (연산 실수 보호) — 반환은 항상 음수 or 0.
     if total > 0.0:

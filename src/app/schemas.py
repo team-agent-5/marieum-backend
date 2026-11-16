@@ -79,7 +79,7 @@ CandidateSource = Literal[
 - `llm_corrected` — 중신뢰 분기 종결어미 LLM 교정본 (G8 verbatim 분기)
 - `catalog`       — phrase_catalog seed (cold-start fallback)
 - `patient_log`   — phrase_log 집계 후보
-- `llm_gen`       — Groq LLM accuracy_mode 재생성
+- `llm_gen`       — LLM accuracy_mode 재생성
 """
 
 RejectReason = Literal["not_this_phrase", "wrong_context", "all_bad"]
@@ -147,7 +147,7 @@ class HealthzResponse(_ZDatetime):
     ts: datetime = Field(description="응답 시각 (UTC)")
     dependencies: dict[str, str] = Field(
         default_factory=dict,
-        description="상류 의존성 상태. db·ml_asr·groq_llm·anthropic 등. 자유 문자열 (예: 'ok','down','unknown','configured','configured_proxy','disabled').",
+        description="상류 의존성 상태. db·ml_asr·anthropic 등. 자유 문자열 (예: 'ok','down','unknown','configured','configured_proxy','disabled').",
     )
 
 
@@ -306,7 +306,7 @@ class SuggestRequest(BaseModel):
     )
     accuracy_mode: bool = Field(
         default=False,
-        description="환자 '정확 모드' 토글. true면 결정론 top-5 → Groq LLM 재생성 3개. "
+        description="환자 '정확 모드' 토글. true면 결정론 top-5 → LLM 재생성 3개. "
                     "false면 결정론 top-3만. final_transcript가 null이면 무시됨.",
     )
     client_ts: datetime | None = Field(

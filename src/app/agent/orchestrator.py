@@ -28,10 +28,10 @@ from app.agent.llm_assist import (
     rerank_proactive,
 )
 from app.agent.rag_retriever import (
-    fetch_patient_phrase_universe,
     RetrievalSource,
     RetrievedCandidate,
     _nfc,
+    fetch_patient_phrase_universe,
     retrieve_for_high,
     retrieve_for_low,
     retrieve_for_mid,
@@ -186,7 +186,7 @@ async def _handle_high(
             for p in tb_phrases if _nfc(p) != _nfc(ml_text)
         ]
 
-    # allowed_set = retrieved ∪ history ∪ 환자 전체 발화 universe (180일).
+    # allowed_set = retrieved | history | 환자 전체 발화 universe (180일).
     # universe는 LLM 입력엔 안 들어가고 가드만 완화 — history 10개에 밀려난
     # 환자 선호 phrase도 통과시킴. verbatim 중복은 llm_assist의 verbatim-skip 가드가 처리.
     universe = await fetch_patient_phrase_universe(session, patient_id)
@@ -277,7 +277,7 @@ async def _handle_mid(
             await session.rollback()
             await session.execute(text("SET LOCAL ivfflat.probes = 2"))
 
-    # allowed_set = verbatim ∪ retrieved ∪ history ∪ universe.
+    # allowed_set = verbatim | retrieved | history | universe.
     ml_nfc = _nfc(ml_text) if ml_text else ""
     universe = await fetch_patient_phrase_universe(session, patient_id)
     allowed_set: set[str] = (
@@ -444,7 +444,7 @@ async def _handle_low(
             await session.rollback()
             await session.execute(text("SET LOCAL ivfflat.probes = 2"))
 
-    # allowed_set = retrieved ∪ history ∪ universe. ml_text는 구조적 제외 (低 분기 설계).
+    # allowed_set = retrieved | history | universe. ml_text는 구조적 제외 (低 분기 설계).
     universe = await fetch_patient_phrase_universe(session, patient_id)
     allowed_set: set[str] = (
         {c.phrase for c in retrieved}

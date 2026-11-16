@@ -24,11 +24,6 @@ class Settings(BaseSettings):
         default="", validation_alias=AliasChoices("ML_ASR_WS_URL", "MARIEUM_ML_ASR_WS_URL")
     )
 
-    # LLM (Groq)
-    groq_api_key: str = ""
-    groq_model: str = "llama-3.3-70b-versatile"
-    groq_timeout_sec: float = 1.5
-
     # 실시간 교정 (Anthropic Haiku via copa proxy): 현재 발화만 전달, 개인 문맥 미사용
     # copa proxy가 받는 모델 ID는 단축형(`claude-haiku-4`). dated snapshot 미지원.
     anthropic_api_key: str = Field(default="", repr=False)

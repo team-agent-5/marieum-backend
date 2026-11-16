@@ -49,12 +49,6 @@ async def lifespan(app: FastAPI):
     log.info("Catalog cache loaded: %d phrases", len(catalog))
     yield
     log.info("Shutting down.")
-    try:
-        from app.agent.llm_assist import _http_client
-        if _http_client is not None:
-            await _http_client.aclose()
-    except Exception:
-        pass
 
 
 # ────────── FastAPI 앱 ──────────
@@ -131,15 +125,7 @@ app.include_router(streaming_router)
 
 @app.get("/healthz", response_model=HealthzResponse, tags=["system"])
 async def healthz() -> HealthzResponse:
-    from app.agent.llm_assist import _circuit_open
     from app.config import settings
-
-    if not settings.groq_api_key:
-        groq_state = "down"  # disabled, no key
-    elif _circuit_open():
-        groq_state = "down"  # 429 circuit open
-    else:
-        groq_state = "ok"
 
     # 실제 라우터와 동일한 설정 사용. 설정 존재만으로 준비 완료를 단정하지 않는다.
     ml_asr_state = "unknown" if settings.ml_asr_ws_url else "down"
@@ -151,7 +137,6 @@ async def healthz() -> HealthzResponse:
         dependencies={
             "db": "unknown",
             "ml_asr": ml_asr_state,
-            "groq_llm": groq_state,
             "anthropic": (
                 "configured_proxy"
                 if settings.anthropic_api_key
@@ -169,7 +154,6 @@ async def warmup() -> dict:
     """Preload heavy models + sanity check. Call before demo."""
     import time
 
-    from app.agent.llm_assist import _get_agent
     from app.services.embedding import get_embedder
 
     t0 = time.perf_counter()
@@ -177,16 +161,11 @@ async def warmup() -> dict:
     t1 = time.perf_counter()
     catalog_count = len(getattr(app.state, "catalog_embeddings", {}))
 
-    # Dry-run Agent construction (no network call) to warm the singleton
-    agent = await _get_agent()
-    agent_state = "constructed" if agent is not None else "disabled"
-
     return {
         "status": "ok",
         "embedder_dim": len(vec),
         "embed_latency_ms": int((t1 - t0) * 1000),
         "catalog_cached": catalog_count,
-        "llm_agent": agent_state,
     }
 
 
