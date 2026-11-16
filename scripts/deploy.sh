@@ -17,7 +17,7 @@
 
 set -euo pipefail
 
-HOST="${HOST:-10.1.1.11}"
+HOST="${HOST:-100.97.211.109}"
 SSH_USER="${SSH_USER:-ncloud}"
 PORT="${PORT:-22}"
 SSH_KEY="${SSH_KEY:-$HOME/.ssh/marieum_ncp}"

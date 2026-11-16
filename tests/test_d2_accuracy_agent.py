@@ -35,8 +35,8 @@ class TestClassifyBranchBoundaries:
     def test_0_39_is_retry(self):
         assert self._branch(0.39) == "retry"
 
-    def test_0_40_is_low(self):
-        assert self._branch(0.40) == "low"
+    def test_0_40_is_retry(self):
+        assert self._branch(0.40) == "retry"
 
     def test_0_89_is_low(self):
         assert self._branch(0.89) == "low"

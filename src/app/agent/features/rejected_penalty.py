@@ -4,13 +4,13 @@ phrase_log 에 `action='rejected'` 로 쌓인 24h 내 로그를 **음수 penalty
 `RankingContext` 에 해당 필드가 **없을 수도 있다** — getattr 로 defensive 하게 접근한다.
 
 공식 (사용자 지침 — 간이화):
-    penalty(phrase) = Σ (-0.15 × exp(-ln2 × hours_ago_i / 24))
+    penalty(phrase) = Σ (-0.15 x exp(-ln2 x hours_ago_i / 24))
                        for each rejected_log_i WHERE phrase_i == phrase
     penalty_clip    = max(-0.5, penalty(phrase))   # 누적 상한 (하한 -0.5)
     반환은 **음수 또는 0** — ranker 가중합에서 `base + rejected_penalty` 로 더해진다.
 
 NOTE: 원문 수식은 F1/F2 를 **곱셈 감쇠** (`s_f1 * (1 - rejected_signal)`) 하지만,
-사용자 지침은 "선형 -0.15 × decay 를 가중합에 **add**" 로 간이화한다 — 1차 MVP 범위.
+사용자 지침은 "선형 -0.15 x decay 를 가중합에 **add**" 로 간이화한다 — 1차 MVP 범위.
 F1/F2 감쇠 방식으로 재조정할 여지 있음 (`FeatureScores.rejected_penalty` 필드만 유지하면 호환).
 
 사용자 지침 "24h 이내 3회 이상 거부 → blacklist 플래그" 는 **본 모듈에서 미구현** —
@@ -19,8 +19,8 @@ Q (결정 보류) 상태이므로 주석만 남긴다.
 from __future__ import annotations
 
 import math
+from collections.abc import Iterable
 from datetime import UTC, datetime
-from typing import Iterable
 
 # -----------------------------------------------------------------------------
 # 상수 — 사용자 지침 명시 값
@@ -119,7 +119,7 @@ def compute(cand: object, ctx: object) -> float:  # type: ignore[override]
     """해당 phrase 의 rejected penalty 계산.
 
     공식:
-        penalty = Σ (-PENALTY_PER_REJECT × exp_decay(hours_since_reject_i))   (24h 내 로그)
+        penalty = Σ (-PENALTY_PER_REJECT x exp_decay(hours_since_reject_i))   (24h 내 로그)
         clip    = max(-CUMULATIVE_FLOOR, penalty)
         → 반환은 **음수 또는 0** (ranker 가중합에서 `base` 에 add).
 

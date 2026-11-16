@@ -4,9 +4,7 @@
     후보 **3개** 반환 — verbatim 1위 + phrase_log 매칭 상위 2개.
 
 **핵심 전략**:
-    1. 1위 **verbatim**: ``features/verbatim.py`` (Phase A3) + ``llm_assist.correct_endings()``
-       (Phase A5) 로 종결어미 보정. LLM 실패 시 ``final_transcript`` 그대로 fallback.
-       교정 LLM timeout **0.5s** (D5).
+    1. 1위 **verbatim**: ASR final_transcript 그대로 사용.
     2. 2·3위 **phrase_log 매칭**: F1 patient_frequency + F2 time_context + F5
        semantic_similarity + F6 preference 가중합 (설계 §4.2).
        가중치::
@@ -14,29 +12,17 @@
            freq=0.30, time=0.25, sem=0.25, prefix=0.20
            preference_bonus 가산
 
-    3. **중복 제거**: verbatim 과 2·3위 매칭 phrase 가 동일하면 다음 상위로 대체
-       (Q22 결정안: 대체).
+    3. **중복 제거**: verbatim 과 2·3위 매칭 phrase 가 동일하면 다음 상위로 대체.
     4. **매칭 부족 fallback** (설계 §2.3b): phrase_log 2개 못 뽑으면 preset
        (phrase_catalog) semantic match 로 채워 **3개 보장**.
 
-**교정 LLM**:
-    * timeout **0.5s** (D5 — 전체 지연 예산 보호)
-    * 실패 시 ``verbatim = final_transcript`` 로 degrade
-    * audit_log 에 ``accuracy_fallback_reason="llm_corrective_timeout"`` 등 기록
-
-Phase A3·A5 가 아직 미완성이므로 ``features.verbatim`` /
-``llm_assist.corrective_rerank_with_llm`` 호출은 **TODO 플레이스홀더** 로 둔다.
-Phase B 통합 시 활성화.
-
 설계 참조:
-    * ``marieum-plan/design/agent-algorithm.md`` §2.3 (중신뢰 분기), §3.9 (verbatim), §4.2 (가중치)
-    * ``backend/docs/agent-rework-plan.md`` §2 Phase A4 mid.py
+    * ``marieum-plan/design/agent-algorithm.md`` §2.3 (중신뢰 분기), §4.2 (가중치)
 """
 from __future__ import annotations
 
 import logging
 import time
-from typing import Iterable
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -52,7 +38,6 @@ from app.agent.features.preference import compute as f_preference
 from app.agent.features.prefix_match import compute as f_prefix_match
 from app.agent.features.semantic_similarity import compute as f_semantic_similarity
 from app.agent.features.time_context import compute as f_time_context
-from app.agent.llm_assist import correct_endings
 from app.agent.pool import gather_candidates
 
 log = logging.getLogger(__name__)
@@ -73,9 +58,6 @@ MID_MATCH_MIN_SCORE: float = 0.15
 # verbatim 최소 길이 (공백 제거 후). 미달 시 재질의로 자연 degrade — ranker 상위에서 처리.
 VERBATIM_MIN_LEN: int = 1
 
-# 교정 LLM timeout (D5, 설계 §5.1 지연 예산).
-LLM_CORRECTIVE_TIMEOUT_S: float = 0.5
-
 
 def _compute_verbatim_text(final_transcript: str | None) -> str | None:
     """ASR final_transcript 를 verbatim 후보 텍스트로 변환.
@@ -92,128 +74,15 @@ def _compute_verbatim_text(final_transcript: str | None) -> str | None:
     return stripped
 
 
-# Hallucination guard — 교정 LLM 결과가 ASR 원본에서 과하게 이탈했는지 검사.
-# 설계 §5.1 환각 가드 4종 중 (1) 단어 집합·(2) 길이 ±50% 를 호출측 책임으로 반영.
-# (3) 입력과 동일 통과 는 자연 통과 (changed=false 라도 OK), (4) timeout 은
-# llm_assist.correct_endings() 가 담당.
-_LENGTH_TOLERANCE: float = 0.5  # ±50% (ratio 기준)
-
-
-def _token_set(text: str) -> set[str]:
-    """공백 split 로 단어 집합 추출.
-
-    구음장애 환자 발화 특성상 어절 단위 비교가 가장 보수적·간단.
-    konlpy/mecab 미도입 (1차 MVP). 비교 전 strip + lower (한국어는 lower 영향 없음).
-    """
-    if not text:
-        return set()
-    return {tok for tok in text.strip().split() if tok}
-
-
-def _recent_phrases(ctx: RankingContext, k: int = 10) -> list[str]:
-    """ctx.freq_counts·last_at 에서 최신 발화 상위 ``k`` 건.
-
-    newest-first 정렬. last_at 이 null 인 phrase 는 제외 (freq 만 있는 catalog seed 등).
-    """
-    pairs: list[tuple[str, Iterable]] = []
-    for phrase in ctx.freq_counts:
-        last = ctx.last_at.get(phrase)
-        if last is not None:
-            pairs.append((phrase, last))
-    pairs.sort(key=lambda x: x[1], reverse=True)  # type: ignore[arg-type,return-value]
-    return [p for p, _ in pairs[:k]]
-
-
-def _guard_corrected(asr_text: str, corrected: str) -> tuple[bool, str | None]:
-    """교정 결과 환각 가드 (설계 §5.1 (1)(2) 공백 split 기반 간이 구현).
-
-    Returns:
-        (ok, reason) — ok=False 면 reason 에 fallback 사유 (audit 용).
-    """
-    corr_stripped = corrected.strip()
-    asr_stripped = asr_text.strip()
-    if not corr_stripped:
-        return False, "guard_empty_corrected"
-
-    # (2) 길이 ±50% 체크
-    asr_len = max(1, len(asr_stripped))
-    corr_len = len(corr_stripped)
-    ratio = corr_len / asr_len
-    if ratio < (1.0 - _LENGTH_TOLERANCE) or ratio > (1.0 + _LENGTH_TOLERANCE):
-        return False, "guard_length_out_of_range"
-
-    # (1) 단어 집합 보존 — corrected 의 단어가 asr 단어 집합 안에 모두 포함되는지.
-    #     종결어미만 바뀌는 경우 어절 자체는 유지되므로 "교정 어절 ⊆ ASR 어절" 체크.
-    asr_tokens = _token_set(asr_stripped)
-    corr_tokens = _token_set(corr_stripped)
-    # ASR 어절이 1개(짧은 발화)면 공백 split 비교가 지나치게 엄격해지므로 skip.
-    if len(asr_tokens) >= 2:
-        extra = corr_tokens - asr_tokens
-        if extra:
-            # 신규 어절 추가 → 환각 가능성 — fallback.
-            return False, "guard_new_tokens_added"
-
-    return True, None
-
-
 async def _correct_verbatim(
     final_transcript: str,
     ctx: RankingContext,
 ) -> tuple[str, bool, str | None, int | None]:
-    """교정 LLM 호출 — 종결어미 보정 + hallucination guard (W2 wiring).
-
-    설계 §5.1 환각 가드 책임 분담:
-        * ``llm_assist.correct_endings()``       → (4) timeout + strict JSON schema
-        * 본 함수 (``_guard_corrected``)         → (1) 단어 집합 비교, (2) 길이 ±50%
-        * 입력과 동일 통과 (3)                     → changed=false 자연 통과
-
-    환자 recent_phrases 는 ``ctx.freq_counts.last_at desc`` 로 10건 추출.
-
-    Returns:
-        (verbatim_text, llm_success, fallback_reason, llm_latency_ms)
-        * llm_success=False 면 verbatim_text = ASR 원본 (final_transcript strip).
-        * fallback_reason: None (성공) | "llm_returned_none" | "guard_*" | ...
-    """
+    """ASR 원문 그대로 반환 (LLM 교정 미사용)."""
     asr_stripped = final_transcript.strip()
     if not asr_stripped:
         return final_transcript, False, "empty_final_transcript", None
-
-    history = _recent_phrases(ctx, k=10)
-
-    _t0 = time.perf_counter()
-    try:
-        result = await correct_endings(
-            asr_stripped,
-            history,
-            timeout_s=LLM_CORRECTIVE_TIMEOUT_S,
-        )
-    except Exception as exc:  # 방어 — llm_assist 가 자체 처리하지만 안전망.
-        err_type = type(exc).__name__
-        latency_ms = int((time.perf_counter() - _t0) * 1000)
-        log.warning("mid._correct_verbatim unexpected: %s (latency_ms=%d)", err_type, latency_ms)
-        return asr_stripped, False, f"error:{err_type}", latency_ms
-
-    latency_ms = int((time.perf_counter() - _t0) * 1000)
-
-    if result is None:
-        # timeout/429/circuit_open/parse_error — llm_assist 가 이미 로깅.
-        return asr_stripped, False, "llm_returned_none", latency_ms
-
-    # Hallucination guard — 설계 §5.1 (1)(2).
-    corrected = result.corrected.strip()
-    if not result.changed:
-        # LLM 이 변경 없음 통지 — ASR 원본 재사용 (guard 생략).
-        return asr_stripped, True, None, latency_ms
-
-    ok, reason = _guard_corrected(asr_stripped, corrected)
-    if not ok:
-        log.warning(
-            "mid.correct_verbatim guard rejected: reason=%s asr=%r corrected=%r",
-            reason, asr_stripped, corrected,
-        )
-        return asr_stripped, False, reason, latency_ms
-
-    return corrected, True, None, latency_ms
+    return asr_stripped, False, "llm_disabled", None
 
 
 def _score_match(
@@ -382,7 +251,6 @@ async def strategy(
         "verbatim_text": verbatim_text,
         "verbatim_llm_success": llm_success,
         "llm_called": llm_called,
-        "llm_timeout_s": LLM_CORRECTIVE_TIMEOUT_S,
         "accuracy_fallback_reason": accuracy_fallback_reason,
         "llm_latency_ms": llm_latency_ms,
         "cold_start": cold_start,

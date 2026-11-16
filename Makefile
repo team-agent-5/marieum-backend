@@ -3,7 +3,7 @@
         tunnel-install tunnel-uninstall tunnel-service-status
 
 # ── NCP 배포/터널 공용 변수 (deploy.sh 와 동일) ──────────────────────────
-HOST       ?= 10.1.1.11
+HOST       ?= 100.97.211.109
 SSH_USER   ?= ncloud
 SSH_PORT   ?= 22
 SSH_KEY    ?= $(HOME)/.ssh/marieum_ncp

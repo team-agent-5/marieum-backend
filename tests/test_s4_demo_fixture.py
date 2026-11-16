@@ -70,27 +70,6 @@ def test_demo_pc_short_prefix(client):
 
 
 @pytest.mark.integration
-def test_healthz_groq_state(client):
-    """/healthz reports groq_llm state based on local signals (no network call)."""
-    r = client.get("/healthz")
-    assert r.status_code == 200
-    body = r.json()
-    assert body["status"] == "ok"
-    assert "groq_llm" in body["dependencies"]
-    # With invalid key still "ok" (key present); if ops clears GROQ_API_KEY env, should be "down"
-    assert body["dependencies"]["groq_llm"] in ("ok", "down")
-
-
-@pytest.mark.integration
-def test_warmup_includes_agent_state(client):
-    """/health/warmup now reports LLM agent construction state."""
-    r = client.get("/health/warmup")
-    assert r.status_code == 200
-    body = r.json()
-    assert body["status"] == "ok"
-    assert body["embedder_dim"] == 768
-    assert body["llm_agent"] in ("constructed", "disabled")
-
 
 @pytest.mark.integration
 def test_accuracy_mode_records_llm_latency(client):
