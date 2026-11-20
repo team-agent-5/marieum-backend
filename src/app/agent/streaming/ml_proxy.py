@@ -45,6 +45,7 @@ class MLProxyConnectionError(MLProxyError):
 class MLProxyEventType(StrEnum):
     TRANSCRIPT_INTERIM = "transcript_interim"
     TRANSCRIPT_FINAL = "transcript_final"
+    SESSION_END = "session_end"  # v2: is_last final 뒤에 서버가 보내는 세션 종료
     ML_ERROR = "ml_error"  # ML이 반환한 에러
     CONNECTION_LOST = "connection_lost"  # 네트워크 끊김
     CONNECTION_CLOSED = "connection_closed"  # 마지막 final 후 ML이 정상 종료
@@ -60,15 +61,14 @@ class MLProxyEvent:
     confidence: float | None = None
     is_final: bool = False
     is_last: bool = False  # 구간 final과 대화 종료를 구분한다.
-    stable_text: str | None = None  # transcript_interim 전용
-    unstable_text: str | None = None  # transcript_interim 전용
-    audio_end_ms: int | None = None  # transcript_interim 전용
-    duration_ms: int | None = None  # transcript_final 전용
-    model_version: str | None = None  # transcript_final 전용
-    no_speech_prob: float | None = None  # transcript_final 전용
+    audio_end_ms: int | None = None  # transcript_delta/interim 전용
+    model_version: str | None = None  # ready 전용
+    no_speech_prob: float | None = None  # segment_final/transcript_final 전용
+    reason: str | None = None  # segment_final: silence/max_length/end/too_long
     segment_id: int = 0
     error_code: str | None = None  # ml_error / connection_lost
     error_message: str | None = None
+    error_fatal: bool = False  # v2 error: fatal이면 서버가 세션을 끝낸 상태
     trace_id: str | None = None
 
 
@@ -81,6 +81,10 @@ def _map_ml_error(ml_code: str) -> str:
         "AUDIO_TOO_LONG": "AUDIO_TOO_LONG",
         "INVALID_FORMAT": "ML_UPSTREAM_UNAVAILABLE",
         "MODEL_UNAVAILABLE": "ML_UPSTREAM_UNAVAILABLE",
+        # v2 추가 코드.
+        "OVERLOADED": "ML_UPSTREAM_UNAVAILABLE",
+        "SESSION_BUSY": "ML_UPSTREAM_UNAVAILABLE",
+        "NO_SESSION": "ML_UPSTREAM_UNAVAILABLE",
     }
     return mapping.get(ml_code, "INTERNAL")
 
@@ -250,17 +254,32 @@ class MLProxySession:
 
                 evt_type = data.get("type")
 
-                if evt_type == "transcript_interim":
+                # v2: ready — 세션 생성 확인. 로그만.
+                if evt_type == "ready":
+                    log.info(
+                        "ml_proxy.ready",
+                        extra={
+                            "trace_id": self.trace_id,
+                            "model": data.get("model_version"),
+                            "chunk_ms": data.get("chunk_ms"),
+                        },
+                    )
+                    continue
+
+                # v2: segment_start — 새 문장 시작. 글자 처리는 delta/final에서.
+                if evt_type == "segment_start":
+                    continue
+
+                # v2: pong — 응답. 무시.
+                if evt_type == "pong":
+                    continue
+
+                # v2: transcript_delta (= v1: transcript_interim)
+                if evt_type in ("transcript_delta", "transcript_interim"):
                     await self._event_queue.put(
                         MLProxyEvent(
                             type=MLProxyEventType.TRANSCRIPT_INTERIM,
                             text=str(data.get("text", "")),
-                            stable_text=str(data["stable_text"])
-                            if data.get("stable_text") is not None
-                            else None,
-                            unstable_text=str(data["unstable_text"])
-                            if data.get("unstable_text") is not None
-                            else None,
                             confidence=float(data["confidence"])
                             if data.get("confidence") is not None
                             else None,  # type: ignore[arg-type]
@@ -272,8 +291,10 @@ class MLProxySession:
                             trace_id=str(data.get("trace_id", self.trace_id)),
                         )
                     )
+                    continue
 
-                elif evt_type == "transcript_final":
+                # v2: segment_final (= v1: transcript_final)
+                if evt_type in ("segment_final", "transcript_final"):
                     self._last_final_received = bool(data.get("is_last", True))
                     await self._event_queue.put(
                         MLProxyEvent(
@@ -284,25 +305,42 @@ class MLProxySession:
                             else None,  # type: ignore[arg-type]
                             is_final=True,
                             is_last=self._last_final_received,
-                            duration_ms=int(data["duration_ms"])
-                            if data.get("duration_ms") is not None
-                            else None,  # type: ignore[arg-type]
-                            model_version=str(data["model_version"])
-                            if data.get("model_version") is not None
-                            else None,
                             no_speech_prob=float(data["no_speech_prob"])
                             if data.get("no_speech_prob") is not None
                             else None,  # type: ignore[arg-type]
+                            reason=str(data["reason"])
+                            if data.get("reason") is not None
+                            else None,
                             segment_id=int(data.get("segment_id", 0)),  # type: ignore[arg-type]
                             trace_id=str(data.get("trace_id", self.trace_id)),
                         )
                     )
-                    # 구간 final 후 다음 구간을 계속 받는다. 종료는 앱 요청이 결정한다.
+                    continue
 
-                elif evt_type == "error":
+                # v2: session_end — is_last final 뒤에 서버가 보내는 세션 종료 신호.
+                # 같은 커넥션에서 다음 start를 쏠 수 있지만 현재 conversation 모드에선 사용 안 함.
+                if evt_type == "session_end":
+                    log.info(
+                        "ml_proxy.session_end",
+                        extra={
+                            "trace_id": self.trace_id,
+                            "segments": data.get("segments"),
+                            "audio_ms": data.get("audio_ms"),
+                        },
+                    )
+                    await self._event_queue.put(
+                        MLProxyEvent(
+                            type=MLProxyEventType.SESSION_END,
+                            trace_id=self.trace_id,
+                        )
+                    )
+                    continue
+
+                if evt_type == "error":
                     code = str(data.get("code", "INTERNAL"))
                     mapped = _map_ml_error(code)
                     raw_msg = str(data.get("message", ""))
+                    fatal = bool(data.get("fatal", False))
                     # 원본 ML 코드를 메시지 앞에 prefix로 담아 분류 정보를 잃지 않는다.
                     # WSErrorCode는 5종 enum이라 코드 자체 분화는 contract 변경이 큼.
                     msg_out = f"[{code}] {raw_msg}".strip() if raw_msg else f"[{code}]"
@@ -312,6 +350,7 @@ class MLProxySession:
                             "trace_id": self.trace_id,
                             "code": code,
                             "mapped": mapped,
+                            "fatal": fatal,
                         },
                     )
                     await self._event_queue.put(
@@ -319,6 +358,7 @@ class MLProxySession:
                             type=MLProxyEventType.ML_ERROR,
                             error_code=mapped,
                             error_message=msg_out,
+                            error_fatal=fatal,
                             trace_id=self.trace_id,
                         )
                     )
