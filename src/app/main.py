@@ -112,6 +112,73 @@ app.add_middleware(
 install_error_handlers(app)
 
 
+# ────────── OpenAPI 커스터마이즈 ──────────
+# FastAPI 기본은 validation 오류를 422로 표기하지만, 우리 핸들러는 400 BAD_REQUEST로
+# 변환해 응답한다(errors.py:_validation). 스웨거 문서도 실제 동작과 일치하도록 교정.
+
+
+def _patch_openapi_validation_code(schema: dict) -> dict:
+    paths = schema.get("paths", {})
+    for ops in paths.values():
+        for op in ops.values():
+            if not isinstance(op, dict):
+                continue
+            responses = op.get("responses", {})
+            if "422" in responses:
+                if "400" not in responses:
+                    responses["400"] = responses.pop("422")
+                else:
+                    # 400이 이미 명시돼 있으면 422는 중복 — 서버가 422를 안 쓰므로 제거.
+                    responses.pop("422")
+    return schema
+
+
+def _register_ws_schemas(schema: dict) -> dict:
+    """FastAPI는 WebSocket 경로/스키마를 OpenAPI에 자동 등록하지 않는다.
+    WS 메시지 스키마를 수동으로 components.schemas에 추가해 스웨거에서 참조 가능하게 한다.
+    """
+    from app.schemas import (
+        WSAudioIn,
+        WSCancelIn,
+        WSCloseIn,
+        WSEndIn,
+        WSErrorOut,
+        WSPingOut,
+        WSSessionEndOut,
+        WSTranscriptOut,
+    )
+
+    components = schema.setdefault("components", {}).setdefault("schemas", {})
+    for cls in (
+        WSTranscriptOut,
+        WSErrorOut,
+        WSPingOut,
+        WSSessionEndOut,
+        WSAudioIn,
+        WSEndIn,
+        WSCancelIn,
+        WSCloseIn,
+    ):
+        components.setdefault(
+            cls.__name__,
+            cls.model_json_schema(ref_template="#/components/schemas/{model}"),
+        )
+    return schema
+
+
+_original_openapi = app.openapi
+
+
+def _custom_openapi() -> dict:
+    schema = _original_openapi()
+    schema = _patch_openapi_validation_code(schema)
+    schema = _register_ws_schemas(schema)
+    return schema
+
+
+app.openapi = _custom_openapi  # type: ignore[assignment]
+
+
 # ────────── 라우터 등록 ──────────
 
 app.include_router(auth.router)
@@ -125,18 +192,49 @@ app.include_router(streaming_router)
 
 @app.get("/healthz", response_model=HealthzResponse, tags=["system"])
 async def healthz() -> HealthzResponse:
-    from app.config import settings
+    import asyncio
 
-    # 실제 라우터와 동일한 설정 사용. 설정 존재만으로 준비 완료를 단정하지 않는다.
-    ml_asr_state = "unknown" if settings.ml_asr_ws_url else "down"
+    import httpx
+    from sqlalchemy import text as sa_text
+
+    from app.config import settings
+    from app.db import AsyncSessionLocal
+
+    # DB: SELECT 1, 1초 타임아웃.
+    async def _check_db() -> str:
+        try:
+            async with AsyncSessionLocal() as db:
+                await asyncio.wait_for(db.execute(sa_text("SELECT 1")), timeout=1.0)
+            return "ok"
+        except Exception:
+            return "down"
+
+    # ML ASR: 설정된 HTTP(/asr) URL에 GET /healthz. 1초 타임아웃.
+    async def _check_ml() -> str:
+        if not settings.ml_asr_url:
+            return "unconfigured"
+        try:
+            async with httpx.AsyncClient(timeout=1.0) as client:
+                r = await client.get(f"{settings.ml_asr_url.rstrip('/')}/healthz")
+            if r.status_code == 200:
+                return "ok"
+            if r.status_code == 503:
+                return "loading"
+            return f"error:{r.status_code}"
+        except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout):
+            return "down"
+        except Exception:
+            return "down"
+
+    db_state, ml_state = await asyncio.gather(_check_db(), _check_ml())
 
     return HealthzResponse(
         status="ok",
         version=app.version,
         ts=datetime.now(UTC),
         dependencies={
-            "db": "unknown",
-            "ml_asr": ml_asr_state,
+            "db": db_state,
+            "ml_asr": ml_state,
             "anthropic": (
                 "configured_proxy"
                 if settings.anthropic_api_key

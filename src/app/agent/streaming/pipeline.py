@@ -154,10 +154,13 @@ class StreamingPipeline:
 
         self.state.debounce_task = asyncio.create_task(_delayed_correct())
 
-    async def handle_final(self, text: str, confidence: float) -> None:
+    async def handle_final(
+        self, text: str, confidence: float, is_last: bool = False
+    ) -> None:
         """ML ``transcript_final`` 수신 시 호출.
 
         debounce 생략 — 즉시 LLM 교정 호출 (§8.5).
+        ``is_last``는 WSTranscriptOut.is_last로 그대로 전달된다.
         """
         if self._closed or self._final_received:
             return
@@ -167,10 +170,11 @@ class StreamingPipeline:
         my_version = self.state.pending_version
 
         log.debug(
-            "handle_final: version=%d text=%.30r confidence=%.2f",
+            "handle_final: version=%d text=%.30r confidence=%.2f is_last=%s",
             my_version,
             text,
             confidence,
+            is_last,
         )
 
         # 기존 debounce cancel
@@ -178,17 +182,13 @@ class StreamingPipeline:
             self.state.debounce_task.cancel()
 
         self._final_received = True
+        # sanitize 결과가 빈 문자열(기호·공백만)이면 LLM 호출/앱 push 없이 조용히 종료.
+        # session.py가 1차로 거르지만 다른 호출자(테스트 등)를 위한 방어.
         if not text:
-            await self.app_ws_push(
-                WSErrorOut(
-                    type="error",
-                    error_code="ASR_LOW_CONFIDENCE",
-                    message="말소리를 인식하지 못했어요. 다시 말해 주세요.",
-                    trace_id=self.state.trace_id,
-                )
-            )
             return
-        await self._correct_and_push(my_version, is_final=True, raw_confidence=confidence)
+        await self._correct_and_push(
+            my_version, is_final=True, raw_confidence=confidence, is_last=is_last
+        )
 
     async def close(self) -> None:
         """정리. debounce 태스크 cancel.
@@ -211,6 +211,7 @@ class StreamingPipeline:
         my_version: int,
         is_final: bool,
         raw_confidence: float | None = None,
+        is_last: bool = False,
     ) -> None:
         """LLM 교정 호출 + stale 체크 + 앱 push.
 
@@ -290,6 +291,7 @@ class StreamingPipeline:
             type="transcript",
             text=corrected,
             final=is_final,
+            is_last=is_last if is_final else False,
             trace_id=self.state.trace_id,
             confidence=raw_confidence if is_final else None,
         )

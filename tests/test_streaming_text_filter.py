@@ -90,6 +90,6 @@ async def test_symbols_only_do_not_become_empty_transcripts_or_llm_requests():
     assert pushed == []
     await pipeline.handle_final("🙂✨\u200b", 0.8)
     await pipeline.close()
-    assert len(pushed) == 1
-    assert pushed[0].type == "error"
-    assert pushed[0].error_code == "ASR_LOW_CONFIDENCE"
+    # 기호·공백만 남는 final은 sanitize 후 빈 문자열이 됨. LLM 호출·앱 push 없이 조용히 종료.
+    # (예전 동작: ASR_LOW_CONFIDENCE 에러 push — 실시간 UX 혼란 유발로 폐기.)
+    assert pushed == []

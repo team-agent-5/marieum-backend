@@ -14,11 +14,10 @@ import base64
 import binascii
 import logging
 import uuid
-
-import httpx
 from datetime import UTC, datetime, timedelta
 from typing import Annotated
 
+import httpx
 from fastapi import (
     APIRouter,
     Depends,
@@ -30,7 +29,7 @@ from fastapi import (
     UploadFile,
     status,
 )
-from sqlalchemy import and_, desc, select
+from sqlalchemy import and_, desc, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent.orchestrator import suggest as orchestrator_suggest
@@ -274,8 +273,11 @@ def _map_candidate_source_to_db(source: str | None) -> str:
         "- `mode=proactive` (conf ≥ 0.98): verbatim 즉시 TTS + 선택적 LLM 제안 모달\n"
         "- `mode=candidates` (0.90 ≤ conf < 0.98): 3후보 선택 UI\n"
         "- `mode=single` (0.40 ≤ conf < 0.90): 단일 후보 큰 글자 UI\n"
-        "- `mode=retry` (conf < 0.40): 재질의 안내 (200 OK, HTTP 422 아님)\n\n"
-        "프론트엔드는 `mode` 필드로 switch 분기."
+        "- `mode=retry` (conf < 0.40): 재질의 안내 (200 OK, HTTP 400/422 아님)\n\n"
+        "프론트엔드는 `mode` 필드로 switch 분기.\n\n"
+        "**trace_id 규칙**: 응답 `trace_id`는 (1) 요청 body의 `trace_id`가 있으면 그 값, "
+        "없으면 (2) `X-Trace-Id` 헤더 값을 그대로 돌려준다. body·header 둘 다 없으면 "
+        "서버가 UUID를 발급한다. 즉 특정 trace를 지정하려면 body 또는 header로 전달."
     ),
 )
 async def suggest(
@@ -499,9 +501,6 @@ async def preset(
         "- `source='voice_bypass'` 로 기록. ranking agent 는 `WHERE source != 'voice_bypass'`\n"
         "  가드로 조회 (ranking engine 오염 방지)."
     ),
-    responses={
-        422: {"description": "ASR confidence < 0.4 → S13 재질의 강제"},
-    },
 )
 async def bypass(
     body: BypassRequest,
@@ -512,18 +511,10 @@ async def bypass(
     """실시간 모드 전용 phrase_log 저장 라우트.
 
     M3 (시니어 결정 §4) 핵심: WS 라우터는 저장 안 함. 이 HTTP 라우트가 유일.
+    v2 ASR 모델 confidence 분포가 전반적으로 낮게 측정돼서(0.2~0.7 범위) 임계값
+    기반 422 거부는 제거. 프론트가 TTS까지 이미 재생했는데 저장만 막는 건 UX에
+    오히려 혼란을 줌. 저신뢰 판단은 향후 실제 분포 수집 후 재설계.
     """
-    # Confidence 재검증 — 저신뢰면 강제 재질의
-    if body.asr_confidence < 0.4:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail={
-                "error_code": "ASR_LOW_CONFIDENCE",
-                "message": "잘 못 들었어요. 다시 말씀해 주세요.",
-                "details": [{"field": "asr_confidence", "issue": "below_threshold", "value": body.asr_confidence}],
-            },
-        )
-
     trace_id = body.trace_id or get_trace_id(request)
 
     bypass_embedding: list[float] | None = None
@@ -622,21 +613,29 @@ async def history(
         None, description="이전 응답의 next_cursor. 과거 방향으로 페이지네이션."
     ),
 ) -> PhraseHistoryResponse:
-    conditions = [
+    # 환자·삭제·기간·"거절 아님" 필터. cursor는 페이지 이동용으로 분리 보관.
+    base_conditions = [
         PhraseLog.patient_id == me.patient_id,
         PhraseLog.deleted_at.is_(None),
+        # 거절(selected_phrase/final_transcript 모두 없음)은 WHERE에서 제외 → limit 전에 반영.
+        PhraseLog.selected_phrase.is_not(None) | PhraseLog.final_transcript.is_not(None),
     ]
 
     if since is not None:
-        conditions.append(PhraseLog.created_at >= _parse_since(since))
+        base_conditions.append(PhraseLog.created_at >= _parse_since(since))
 
+    page_conditions = list(base_conditions)
     if cursor is not None:
         cur_ts, cur_id = _decode_history_cursor(cursor)
         # (created_at, id) 복합 커서 — 동일 ts 중복 안전.
-        conditions.append(
+        page_conditions.append(
             (PhraseLog.created_at < cur_ts)
             | and_(PhraseLog.created_at == cur_ts, PhraseLog.id < cur_id)
         )
+
+    # 총 개수 — cursor 무관, 필터와 일치. 프론트 페이지네이션 표시용.
+    total_stmt = select(func.count()).select_from(PhraseLog).where(*base_conditions)
+    total_estimate = int((await session.execute(total_stmt)).scalar_one())
 
     stmt = (
         select(
@@ -647,7 +646,7 @@ async def history(
             PhraseLog.selected_rank,
             PhraseLog.created_at,
         )
-        .where(*conditions)
+        .where(*page_conditions)
         .order_by(desc(PhraseLog.created_at), desc(PhraseLog.id))
         .limit(limit + 1)
     )
@@ -665,7 +664,6 @@ async def history(
             created_at=r.created_at,
         )
         for r in page_rows
-        if r.selected_phrase or r.final_transcript
     ]
 
     next_cursor = (
@@ -677,5 +675,5 @@ async def history(
     return PhraseHistoryResponse(
         items=items,
         next_cursor=next_cursor,
-        total_estimate=len(items) + (1 if has_more else 0),
+        total_estimate=total_estimate,
     )

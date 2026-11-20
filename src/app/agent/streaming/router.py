@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections import defaultdict
 
 import jwt as pyjwt
@@ -110,6 +111,9 @@ async def ws_phrase_stream(
         4001 — JWT 인증 실패
         4003 — 동시 접속 한도 초과
     """
+    # 타이밍 측정 — 각 단계 지연 분해.
+    t0 = time.perf_counter()
+
     # 1. 토큰 추출: 서브프로토콜 우선, 쿼리는 레거시 폴백
     subproto_token = _extract_token_from_subprotocols(ws)
     accept_subprotocol: str | None = None
@@ -140,14 +144,18 @@ async def ws_phrase_stream(
         )
         await ws.close(code=4001, reason="JWT 인증 실패")
         return
+    t_jwt = time.perf_counter()
 
     # 3. WebSocket accept (서브프로토콜 echo)
     await ws.accept(subprotocol=accept_subprotocol)
+    t_accept = time.perf_counter()
     log.info(
         "ws_phrase_stream.connected",
         extra={
             "patient_id": str(principal.patient_id),
             "remote": ws.client,
+            "jwt_ms": int((t_jwt - t0) * 1000),
+            "accept_ms": int((t_accept - t_jwt) * 1000),
         },
     )
 
@@ -160,6 +168,7 @@ async def ws_phrase_stream(
         )
         await ws.close(code=4003, reason="동시 접속 한도 초과")
         return
+    t_cap = time.perf_counter()
 
     # 3. 운영 ML 주소. 미설정/장애는 오류로 알리고 연결 종료는 프론트가 결정한다.
     ml_ws_url = settings.ml_asr_ws_url
@@ -180,6 +189,16 @@ async def ws_phrase_stream(
             extra={"patient_id": str(principal.patient_id)},
         )
         await session.push_error("INTERNAL", "실시간 연결 초기화에 실패했습니다")
+    t_ready = time.perf_counter()
+    log.info(
+        "ws_phrase_stream.ready trace_id=%s total=%dms jwt=%dms accept=%dms cap=%dms session_start=%dms",
+        session.trace_id,
+        int((t_ready - t0) * 1000),
+        int((t_jwt - t0) * 1000),
+        int((t_accept - t_jwt) * 1000),
+        int((t_cap - t_accept) * 1000),
+        int((t_ready - t_cap) * 1000),
+    )
 
     # 6. 메시지 루프
     try:

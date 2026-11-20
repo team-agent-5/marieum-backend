@@ -9,7 +9,7 @@
 
 **재export 심볼** (전부 `app.schemas`에서):
 - WSAudioIn, WSEndIn, WSCancelIn, WSClientMessage
-- WSTranscriptOut, WSErrorOut, WSServerMessage
+- WSTranscriptOut, WSErrorOut, WSPingOut, WSSessionEndOut, WSServerMessage
 - WSErrorCode, WSCloseCode
 
 **streaming 전용 추가 심볼** (이 모듈에서 정의):
@@ -26,7 +26,9 @@ from app.schemas import (
     WSEndIn,
     WSErrorCode,
     WSErrorOut,
+    WSPingOut,
     WSServerMessage,
+    WSSessionEndOut,
     WSTranscriptOut,
 )
 
@@ -38,6 +40,8 @@ __all__ = [
     "WSEndIn",
     "WSErrorCode",
     "WSErrorOut",
+    "WSPingOut",
     "WSServerMessage",
+    "WSSessionEndOut",
     "WSTranscriptOut",
 ]

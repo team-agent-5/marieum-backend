@@ -151,7 +151,9 @@ async def test_end_without_ml_final_keeps_connections_open_past_old_timeout() ->
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(("text", "no_speech"), [("", 1.0), ("  ", 0.0), ("없는 말", 1.0)])
-async def test_silent_final_asks_again_without_llm(text, no_speech) -> None:
+async def test_silent_final_is_skipped_quietly(text, no_speech) -> None:
+    """빈 final/no_speech_prob=1.0은 ML v2에서 VAD 오감지 등으로 자주 발생.
+    에러로 노출하지 않고 조용히 무시한다. LLM 교정도 호출하지 않는다."""
     proxy = make_proxy()
     correct = AsyncMock()
 
@@ -169,7 +171,14 @@ async def test_silent_final_asks_again_without_llm(text, no_speech) -> None:
         await session.start()
         await asyncio.wait_for(session._ml_event_task, 1)
         correct.assert_not_awaited()
-        assert ws.send_json.call_args.args[0]["error_code"] == "ASR_LOW_CONFIDENCE"
+        # 에러/트랜스크립트 어떤 것도 프론트로 push하지 않아야 한다.
+        pushed = [c.args[0] for c in ws.send_json.call_args_list]
+        assert not any(msg.get("type") == "error" for msg in pushed), (
+            f"빈 final은 에러로 노출되면 안 된다. pushed={pushed}"
+        )
+        assert not any(msg.get("type") == "transcript" for msg in pushed), (
+            f"빈 final은 transcript로도 전달되면 안 된다. pushed={pushed}"
+        )
         proxy.close.assert_not_awaited()
         ws.close.assert_not_awaited()
         await session._close()
