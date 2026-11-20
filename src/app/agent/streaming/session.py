@@ -46,6 +46,7 @@ from app.db import AsyncSessionLocal
 from app.schemas import (
     PatientPrincipal,
     WSErrorOut,
+    WSSessionEndOut,
     WSTranscriptOut,
 )
 
@@ -208,8 +209,9 @@ class StreamingSession:
                         "bytes_in_window": self._rl_bytes_in_window,
                     },
                 )
+                # 길이 초과(AUDIO_TOO_LONG)와 전송 속도 초과를 코드로 분리.
                 await self._push_error(
-                    "AUDIO_TOO_LONG", "오디오 전송 속도가 상한을 초과했습니다"
+                    "RATE_LIMITED", "오디오 전송 속도가 상한을 초과했습니다"
                 )
                 return True
             self._bytes_received += len(raw)
@@ -268,18 +270,17 @@ class StreamingSession:
                     if event.is_last:
                         self._end_pending = False
                     await self._select_segment(event.segment_id)
-                    # end 후 빈 마지막 final은 잔여 음성이 없다는 정상 응답이다.
-                    if self._input_ended and event.is_last and not (event.text or "").strip():
-                        continue
-                    if not (event.text or "").strip() or event.no_speech_prob == 1.0:
-                        await self._pipeline.close()
-                        await self._push_error(
-                            "ASR_LOW_CONFIDENCE", "말소리를 인식하지 못했어요. 다시 말해 주세요."
-                        )
+                    is_empty = not (event.text or "").strip() or event.no_speech_prob == 1.0
+                    # 빈 final은 ML v2에서 자주 발생:
+                    #  - 중간 segment: VAD가 150ms 음성 감지했지만 실제 말은 없었던 경우
+                    #  - is_last: end 뒤 잔여 음성 없을 때 (서버가 is_last 보장 위해 항상 보냄)
+                    # 둘 다 정상 신호이므로 조용히 무시한다. UX에 노출하지 않음.
+                    if is_empty:
                         continue
                     await self._pipeline.handle_final(
                         event.text or "",
                         event.confidence or 0.0,
+                        is_last=event.is_last,
                     )
                     self._final_count += 1
                     await self._audit(
@@ -304,9 +305,16 @@ class StreamingSession:
                         self._input_ended = True
                 elif event.type == MLProxyEventType.SESSION_END:
                     # v2: is_last final 뒤에 서버가 정상 세션 종료 신호 송출.
+                    # 앱에도 알려서 "end 보낸 뒤 어떤 final이 마지막인지" 판단 가능하게 한다.
                     # 재연결하지 않는다. 다음 세션은 프론트가 WS를 새로 열 때 시작.
                     self._ml_available = False
                     self._input_ended = True
+                    await self._push_message(
+                        WSSessionEndOut(type="session_end", trace_id=self.trace_id)
+                    )
+                    # 세션이 정상 종료됐으니 서버 측에서 WS도 닫는다 (idempotent).
+                    # 프론트가 못 닫는 경우에도 소켓이 15초 열려있지 않도록.
+                    await self._close(code=1000)
                     break
                 elif event.type == MLProxyEventType.CONNECTION_LOST:
                     self._ml_available = False
@@ -465,7 +473,9 @@ class StreamingSession:
 
     # ── 메시지 push 유틸 ─────────────────────────────────────────────────────
 
-    async def _push_message(self, msg: WSTranscriptOut | WSErrorOut) -> None:
+    async def _push_message(
+        self, msg: WSTranscriptOut | WSErrorOut | WSSessionEndOut
+    ) -> None:
         """앱 WS로 JSON 전송. version_id는 pipeline에서 사용하므로 여기서 노출 안 됨."""
         if self._closed:
             return

@@ -634,6 +634,7 @@ class TranscribeResponse(_ZDatetime):
 WSErrorCode = Literal[
     "UNAUTHORIZED",
     "AUDIO_TOO_LONG",
+    "RATE_LIMITED",
     "ML_UPSTREAM_UNAVAILABLE",
     "ASR_LOW_CONFIDENCE",
     "INTERNAL",
@@ -729,6 +730,10 @@ class WSTranscriptOut(BaseModel):
     final: bool = Field(
         description="false=interim (화면 갱신용), true=final (TTS 재생 신호).",
     )
+    is_last: bool = Field(
+        default=False,
+        description="true=이 세션에서 마지막 final. 이후 session_end 메시지가 1회 전송된다. interim/중간 final은 false.",
+    )
     trace_id: str = Field(description="세션 UUID. 서버가 WS accept 직후 발급.")
     confidence: float | None = Field(
         default=None,
@@ -736,6 +741,22 @@ class WSTranscriptOut(BaseModel):
         le=1.0,
         description="final=true 일 때 ML ASR confidence를 그대로 전달. LLM 자체 confidence와 별개. interim은 null/생략.",
     )
+
+
+class WSPingOut(BaseModel):
+    """서버→앱: Cloudflare 100s idle 방지용 keepalive. 앱은 무시해도 무방."""
+
+    model_config = ConfigDict(extra="forbid")
+    type: Literal["ping"] = Field(description="고정.")
+    trace_id: str = Field(description="세션 UUID.")
+
+
+class WSSessionEndOut(BaseModel):
+    """서버→앱: 세션 정상 종료 신호. is_last=true final 뒤에 1회 송출."""
+
+    model_config = ConfigDict(extra="forbid")
+    type: Literal["session_end"] = Field(description="고정.")
+    trace_id: str = Field(description="세션 UUID.")
 
 
 class WSErrorOut(BaseModel):
@@ -749,13 +770,15 @@ class WSErrorOut(BaseModel):
 
 
 WSServerMessage = Annotated[
-    WSTranscriptOut | WSErrorOut,
+    WSTranscriptOut | WSErrorOut | WSPingOut | WSSessionEndOut,
     Field(discriminator="type"),
 ]
 """서버→앱 메시지 discriminated Union.
 
-**시니어 결정 §4 (M2)**: interim/final 분리 모델(`WSInterimOut`/`WSFinalOut`) 폐기.
-`WSTranscriptOut{final: bool}` 1종 + 에러로 통일.
+- `transcript`: interim/final 통합. final=true + is_last=true면 세션의 마지막 final.
+- `error`: 운영 오류 (WSErrorCode 6종).
+- `ping`: Cloudflare idle 방지 keepalive (25s 주기).
+- `session_end`: 세션 정상 종료 신호 (is_last final 뒤 1회).
 """
 
 
@@ -809,6 +832,8 @@ __all__ = [
     "WSEndIn",
     "WSErrorCode",
     "WSErrorOut",
+    "WSPingOut",
     "WSServerMessage",
+    "WSSessionEndOut",
     "WSTranscriptOut",
 ]

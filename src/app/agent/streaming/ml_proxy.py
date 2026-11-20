@@ -12,6 +12,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import time
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Literal
@@ -142,6 +143,7 @@ class MLProxySession:
 
     async def open(self) -> None:
         """ML WebSocket 연결 열고 start 메시지 전송 + 수신 태스크 시작."""
+        t0 = time.perf_counter()
         try:
             self._ws = await websockets.connect(
                 self.ml_ws_url,
@@ -152,6 +154,7 @@ class MLProxySession:
             )
         except (OSError, websockets.exceptions.WebSocketException) as e:
             raise MLProxyConnectionError(f"ML connection failed: {e}") from e
+        t_conn = time.perf_counter()
 
         start_msg: dict[str, object] = {
             "type": "start",
@@ -163,12 +166,14 @@ class MLProxySession:
             "mode": self.mode,
         }
         await self._ws.send(json.dumps(start_msg))
-        log.info("ml_proxy.start.sent", extra={"trace_id": self.trace_id})
+        t_sent = time.perf_counter()
 
         self._recv_task = asyncio.create_task(self._recv_loop())
         log.info(
-            "ml_proxy.connected",
-            extra={"trace_id": self.trace_id, "url": self.ml_ws_url},
+            "ml_proxy.connected trace_id=%s ws_connect=%dms start_send=%dms",
+            self.trace_id,
+            int((t_conn - t0) * 1000),
+            int((t_sent - t_conn) * 1000),
         )
 
     # ── 송신 ─────────────────────────────────────────────────────────────────
