@@ -748,28 +748,14 @@ class WSErrorOut(BaseModel):
     trace_id: str = Field(description="로그 상관관계 추적용.")
 
 
-class WSEndNoticeOut(BaseModel):
-    """서버→앱: 세션 강제 종료 알림 (close 전).
-
-    1차 MVP는 `reason="max_duration"` 만 구현.
-    client_cancel 은 close code 1001 로 커버됨.
-    """
-
-    model_config = ConfigDict(extra="forbid")
-    type: Literal["end_notice"] = Field(description="고정.")
-    reason: Literal["max_duration"] = Field(
-        description="1차 MVP: 10초 초과 'max_duration' 만 구현.",
-    )
-
-
 WSServerMessage = Annotated[
-    WSTranscriptOut | WSErrorOut | WSEndNoticeOut,
+    WSTranscriptOut | WSErrorOut,
     Field(discriminator="type"),
 ]
 """서버→앱 메시지 discriminated Union.
 
 **시니어 결정 §4 (M2)**: interim/final 분리 모델(`WSInterimOut`/`WSFinalOut`) 폐기.
-`WSTranscriptOut{final: bool}` 1종 + 에러 + end_notice 로 통일.
+`WSTranscriptOut{final: bool}` 1종 + 에러로 통일.
 """
 
 
@@ -821,7 +807,6 @@ __all__ = [
     "WSCloseCode",
     "WSCloseIn",
     "WSEndIn",
-    "WSEndNoticeOut",
     "WSErrorCode",
     "WSErrorOut",
     "WSServerMessage",
