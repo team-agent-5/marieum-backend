@@ -328,6 +328,8 @@ class MLProxySession:
                             "audio_ms": data.get("audio_ms"),
                         },
                     )
+                    # 뒤이은 WS close를 CONNECTION_LOST가 아닌 CONNECTION_CLOSED로 분류되게 한다.
+                    self._last_final_received = True
                     await self._event_queue.put(
                         MLProxyEvent(
                             type=MLProxyEventType.SESSION_END,
