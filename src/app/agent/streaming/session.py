@@ -297,6 +297,17 @@ class StreamingSession:
                         event.error_code or "INTERNAL",
                         event.error_message or "ML 오류",
                     )
+                    # v2 fatal 에러: 서버가 이미 세션을 끝낸 상태라 추가 오디오 전송 무의미.
+                    # 입력 차단 + 재연결은 ML이 WS를 닫을 때 CONNECTION_LOST 경로에서 처리.
+                    if event.error_fatal:
+                        self._ml_available = False
+                        self._input_ended = True
+                elif event.type == MLProxyEventType.SESSION_END:
+                    # v2: is_last final 뒤에 서버가 정상 세션 종료 신호 송출.
+                    # 재연결하지 않는다. 다음 세션은 프론트가 WS를 새로 열 때 시작.
+                    self._ml_available = False
+                    self._input_ended = True
+                    break
                 elif event.type == MLProxyEventType.CONNECTION_LOST:
                     self._ml_available = False
                     await self._push_error(
@@ -306,9 +317,12 @@ class StreamingSession:
                     self._schedule_reconnect()
                     break
                 elif event.type == MLProxyEventType.CONNECTION_CLOSED:
+                    # v2에서는 session_end 후 WS가 닫히는 흐름. 이미 SESSION_END에서 정리됐으면
+                    # 재연결하지 않는다. 그 외(예상치 못한 close)는 재연결.
                     self._ml_available = False
-                    self._schedule_reconnect()
-                    break  # ML이 정상 종료해도 프론트 연결은 닫지 않는다.
+                    if not self._input_ended:
+                        self._schedule_reconnect()
+                    break
         except asyncio.CancelledError:
             raise
         except Exception:
