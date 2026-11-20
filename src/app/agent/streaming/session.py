@@ -24,8 +24,10 @@ import asyncio
 import contextlib
 import json
 import logging
+import time
 import uuid
 from collections.abc import Awaitable, Callable
+from typing import Any
 
 from fastapi import WebSocket, WebSocketDisconnect
 
@@ -38,7 +40,9 @@ from app.agent.streaming.pipeline import (
     StreamingPipeline,
     StreamingSessionState,
 )
+from app.audit import audit_append
 from app.config import settings
+from app.db import AsyncSessionLocal
 from app.schemas import (
     PatientPrincipal,
     WSErrorOut,
@@ -51,6 +55,10 @@ ML_RESPONSE_TIMEOUT_S = 30.0
 ML_RETRY_INITIAL_S = 1.0
 ML_RETRY_MAX_S = 8.0
 MAX_RECONNECT_BUFFER_BYTES = 320_000
+# Cloudflare Tunnel idle 타임아웃(100s)보다 짧게. 무음 구간에서 터널이 끊기지 않도록 주기 ping.
+KEEPALIVE_INTERVAL_S = 25.0
+# 인바운드 PCM 레이트 리밋: PCM16 16kHz mono = 32,000 B/s가 정상. 1.5x 헤드룸.
+MAX_INBOUND_BYTES_PER_SEC = 48_000
 
 
 # ─── 세션 ────────────────────────────────────────────────────────────────────
@@ -92,6 +100,7 @@ class StreamingSession:
         self._ml_event_task: asyncio.Task[None] | None = None
         self._reconnect_task: asyncio.Task[None] | None = None
         self._watchdog_task: asyncio.Task[None] | None = None
+        self._keepalive_task: asyncio.Task[None] | None = None
         self._ml_lock = asyncio.Lock()
         self._response_pending_since: float | None = None
         self._pending_audio = bytearray()
@@ -101,10 +110,22 @@ class StreamingSession:
         self._segment_id: int | None = None
         self._closed: bool = False
 
+        # Audit: 접속 시각(monotonic), 송신 바이트, final 횟수, close 코드
+        self._started_at: float = time.monotonic()
+        self._bytes_received: int = 0
+        self._final_count: int = 0
+        self._audit_logged_close: bool = False
+
+        # 레이트 리밋(1초 슬라이딩 윈도우).
+        self._rl_window_start: float = 0.0
+        self._rl_bytes_in_window: int = 0
+
     # ── 세션 시작 ────────────────────────────────────────────────────────────
 
     async def start(self) -> None:
         """세션 초기화: ML proxy open → 문자 필터 pipeline → 백그라운드 수신."""
+        # CF 터널 idle 타임아웃보다 짧은 주기로 ping. ML URL 미설정 시에도 소켓은 살아있게 둔다.
+        self._keepalive_task = asyncio.create_task(self._keepalive_loop())
         if not self.ml_ws_url.strip():
             await self._push_error(
                 "ML_UPSTREAM_UNAVAILABLE", "ML ASR WebSocket 주소가 설정되지 않았습니다"
@@ -145,6 +166,7 @@ class StreamingSession:
             "streaming_session.started",
             extra={"trace_id": self.trace_id},
         )
+        await self._audit("ws_stream_connected", {"ml_ws_url": self.ml_ws_url})
 
     async def _select_segment(self, segment_id: int) -> None:
         """구간별 final 가드/교정 상태를 분리해 다음 문장의 결과도 처리한다."""
@@ -172,6 +194,25 @@ class StreamingSession:
         if isinstance(raw, bytes):
             if self._input_ended:
                 return True
+            # 레이트 리밋: 1초 윈도우로 바이트 집계, 상한 초과 시 드롭 + 에러 push.
+            now = time.monotonic()
+            if now - self._rl_window_start >= 1.0:
+                self._rl_window_start = now
+                self._rl_bytes_in_window = 0
+            self._rl_bytes_in_window += len(raw)
+            if self._rl_bytes_in_window > MAX_INBOUND_BYTES_PER_SEC:
+                log.warning(
+                    "streaming_session.rate_limited",
+                    extra={
+                        "trace_id": self.trace_id,
+                        "bytes_in_window": self._rl_bytes_in_window,
+                    },
+                )
+                await self._push_error(
+                    "AUDIO_TOO_LONG", "오디오 전송 속도가 상한을 초과했습니다"
+                )
+                return True
+            self._bytes_received += len(raw)
             async with self._ml_lock:
                 if self._ml_proxy is None or not self._ml_available:
                     await self._buffer_audio(raw)
@@ -211,7 +252,12 @@ class StreamingSession:
             return
         try:
             async for event in self._ml_proxy.recv_events():
-                if self._response_pending_since is not None:
+                # 진행 중 응답(interim)만 pending 타이머를 연장한다.
+                # 다른 이벤트(ML_ERROR, CONNECTION_*)가 계속 흘러도 워치독이 정상 발동해야 한다.
+                if (
+                    event.type == MLProxyEventType.TRANSCRIPT_INTERIM
+                    and self._response_pending_since is not None
+                ):
                     self._response_pending_since = asyncio.get_running_loop().time()
                 if event.type == MLProxyEventType.TRANSCRIPT_INTERIM:
                     await self._select_segment(event.segment_id)
@@ -234,6 +280,16 @@ class StreamingSession:
                     await self._pipeline.handle_final(
                         event.text or "",
                         event.confidence or 0.0,
+                    )
+                    self._final_count += 1
+                    await self._audit(
+                        "ws_stream_final",
+                        {
+                            "segment_id": event.segment_id,
+                            "is_last": event.is_last,
+                            "confidence": event.confidence,
+                            "text_len": len(event.text or ""),
+                        },
                     )
                     # 구간 final / is_last 모두 프론트의 연결 종료 요청이 아니다.
                 elif event.type == MLProxyEventType.ML_ERROR:
@@ -341,6 +397,41 @@ class StreamingSession:
                     "ML_UPSTREAM_UNAVAILABLE", "ML 응답 대기 30초 초과. ML에 다시 연결합니다"
                 )
 
+    async def _audit(self, event: str, payload: dict[str, Any]) -> None:
+        """Audit 로그 1건 기록. 실패해도 세션 흐름을 막지 않는다."""
+        try:
+            async with AsyncSessionLocal() as db:
+                await audit_append(
+                    db,
+                    trace_id=self.trace_id,
+                    event=event,
+                    payload=payload,
+                    patient_id=self.patient_principal.patient_id,
+                )
+                await db.commit()
+        except Exception:
+            log.exception(
+                "streaming_session.audit_failed",
+                extra={"trace_id": self.trace_id, "event": event},
+            )
+
+    async def _keepalive_loop(self) -> None:
+        """Cloudflare 100s idle 방지용 서버→클라 ping. 클라는 무시해도 무방."""
+        while not self._closed:
+            await asyncio.sleep(KEEPALIVE_INTERVAL_S)
+            if self._closed:
+                return
+            try:
+                await self.app_ws.send_json({"type": "ping", "trace_id": self.trace_id})
+            except (WebSocketDisconnect, OSError):
+                return
+            except Exception:
+                log.exception(
+                    "streaming_session.keepalive_failed",
+                    extra={"trace_id": self.trace_id},
+                )
+                return
+
     async def _end_input(self) -> None:
         """end는 입력 종료이며 프론트 연결을 닫지 않는다."""
         if self._input_ended or self._closed:
@@ -384,6 +475,15 @@ class StreamingSession:
         )
         await self._push_message(msg)
 
+    # ── 외부(라우터)에서 호출하는 public API ─────────────────────────────────
+    #    내부 helper를 그대로 노출. 모듈 경계를 명시적으로 두기 위함.
+
+    async def push_error(self, error_code: str, message: str) -> None:
+        await self._push_error(error_code, message)
+
+    async def close(self, code: int = 1000, reason: str = "") -> None:
+        await self._close(code=code, reason=reason)
+
     # ── 세션 종료 ────────────────────────────────────────────────────────────
 
     async def _close(self, code: int = 1000, reason: str = "") -> None:
@@ -400,7 +500,12 @@ class StreamingSession:
         # 종료를 실행하는 자기 자신은 취소하지 않는다. 형제 task 종료를 기다린다.
         tasks = [
             task
-            for task in (self._ml_event_task, self._reconnect_task, self._watchdog_task)
+            for task in (
+                self._ml_event_task,
+                self._reconnect_task,
+                self._watchdog_task,
+                self._keepalive_task,
+            )
             if task is not None and task is not asyncio.current_task()
         ]
         for task in tasks:
@@ -427,3 +532,15 @@ class StreamingSession:
             "streaming_session.closed",
             extra={"trace_id": self.trace_id, "code": code},
         )
+
+        if not self._audit_logged_close:
+            self._audit_logged_close = True
+            await self._audit(
+                "ws_stream_closed",
+                {
+                    "close_code": code,
+                    "duration_s": round(time.monotonic() - self._started_at, 3),
+                    "bytes_received": self._bytes_received,
+                    "final_count": self._final_count,
+                },
+            )

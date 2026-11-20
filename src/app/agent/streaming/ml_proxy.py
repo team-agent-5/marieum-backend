@@ -302,6 +302,10 @@ class MLProxySession:
                 elif evt_type == "error":
                     code = str(data.get("code", "INTERNAL"))
                     mapped = _map_ml_error(code)
+                    raw_msg = str(data.get("message", ""))
+                    # 원본 ML 코드를 메시지 앞에 prefix로 담아 분류 정보를 잃지 않는다.
+                    # WSErrorCode는 5종 enum이라 코드 자체 분화는 contract 변경이 큼.
+                    msg_out = f"[{code}] {raw_msg}".strip() if raw_msg else f"[{code}]"
                     log.warning(
                         "ml_proxy.recv.error",
                         extra={
@@ -314,7 +318,7 @@ class MLProxySession:
                         MLProxyEvent(
                             type=MLProxyEventType.ML_ERROR,
                             error_code=mapped,
-                            error_message=str(data.get("message", "")),
+                            error_message=msg_out,
                             trace_id=self.trace_id,
                         )
                     )

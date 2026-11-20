@@ -1,6 +1,15 @@
 """WebSocket 라우터 — ``/ws/phrase/stream``.
 
-JWT는 쿼리 파라미터 ``?token=<jwt>`` 로 받는다 (§S2: Cloudflare/브라우저 호환).
+JWT는 **Sec-WebSocket-Protocol 서브프로토콜**로 받는다. 클라이언트 예시::
+
+    new WebSocket(url, ["marieum.jwt.v1", "<access_token>"])
+
+서버는 토큰 문자열을 꺼내 검증하고 ``marieum.jwt.v1``을 echo 해 accept 한다.
+토큰이 액세스 로그·CDN 로그·브라우저 히스토리에 남지 않게 하기 위함.
+
+**레거시**: ``?token=<jwt>`` 쿼리 파라미터도 당분간 허용(프론트 마이그레이션 완료 후 제거).
+쿼리 사용 시 warning 로그가 찍힌다.
+
 trace_id는 accept 직후 서버가 UUIDv4로 발급한다 (클라이언트 입력 무시, §S1).
 
 앱 → 서버 오디오: PCM16 little-endian / 16kHz / mono, 100ms당 3,200바이트.
@@ -21,7 +30,9 @@ WAV 헤더 없이 바이너리로 전송하고 마지막 잔여 청크 뒤 JSON 
 
 from __future__ import annotations
 
+import asyncio
 import logging
+from collections import defaultdict
 
 import jwt as pyjwt
 from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect
@@ -34,31 +45,95 @@ log = logging.getLogger(__name__)
 
 router = APIRouter(tags=["streaming"])
 
+# 환자당 동시 WS 접속 cap. 한 환자가 N개 소켓을 열어 reconnect/watchdog/ML 커넥션을
+# N배 쓰는 것을 막는다. 초과 시 4003으로 거절.
+MAX_CONN_PER_PATIENT = 1
+_conn_counts: dict[str, int] = defaultdict(int)
+_conn_lock = asyncio.Lock()
+
+
+async def _try_acquire_slot(patient_id: str) -> bool:
+    async with _conn_lock:
+        if _conn_counts[patient_id] >= MAX_CONN_PER_PATIENT:
+            return False
+        _conn_counts[patient_id] += 1
+        return True
+
+
+async def _release_slot(patient_id: str) -> None:
+    async with _conn_lock:
+        if _conn_counts[patient_id] <= 1:
+            _conn_counts.pop(patient_id, None)
+        else:
+            _conn_counts[patient_id] -= 1
+
+
+# 서브프로토콜 식별자. 클라는 ["marieum.jwt.v1", "<token>"] 2개를 보낸다.
+WS_SUBPROTOCOL = "marieum.jwt.v1"
+
+
+def _extract_token_from_subprotocols(ws: WebSocket) -> str | None:
+    """Sec-WebSocket-Protocol 헤더에서 토큰 추출.
+
+    규약: 첫 번째 프로토콜은 식별자(WS_SUBPROTOCOL), 두 번째가 실제 JWT.
+    둘 중 하나라도 없으면 None.
+    """
+    raw = ws.headers.get("sec-websocket-protocol")
+    if not raw:
+        return None
+    protocols = [p.strip() for p in raw.split(",") if p.strip()]
+    if WS_SUBPROTOCOL not in protocols:
+        return None
+    # 식별자를 제외한 나머지 중 첫 번째를 토큰으로 본다.
+    for p in protocols:
+        if p != WS_SUBPROTOCOL:
+            return p
+    return None
+
 # ─── 엔드포인트 ───────────────────────────────────────────────────────────────
 
 
 @router.websocket("/ws/phrase/stream")
 async def ws_phrase_stream(
     ws: WebSocket,
-    token: str = Query(..., description="JWT access token (쿼리 파라미터)"),
+    token: str | None = Query(None, description="(레거시) JWT access token. 서브프로토콜 사용 권장."),
 ) -> None:
     """실시간 모드 WebSocket 엔드포인트.
 
-    Args:
-        ws:    FastAPI WebSocket 연결 객체.
-        token: JWT access token (쿼리 파라미터 ``?token=<jwt>``).
+    Auth:
+        우선순위 1 — ``Sec-WebSocket-Protocol: marieum.jwt.v1, <jwt>``
+        우선순위 2 (레거시) — ``?token=<jwt>`` 쿼리
 
     Close codes:
         1000 — 정상 종료
         1001 — 클라이언트 cancel
         4001 — JWT 인증 실패
+        4003 — 동시 접속 한도 초과
     """
-    # 1. JWT 검증 (accept 전에 수행 — 4001 close를 보내기 위해 먼저 accept 필요)
+    # 1. 토큰 추출: 서브프로토콜 우선, 쿼리는 레거시 폴백
+    subproto_token = _extract_token_from_subprotocols(ws)
+    accept_subprotocol: str | None = None
+    if subproto_token is not None:
+        token_value = subproto_token
+        accept_subprotocol = WS_SUBPROTOCOL
+    elif token is not None:
+        token_value = token
+        log.warning(
+            "ws_phrase_stream.legacy_query_token",
+            extra={"remote": ws.client},
+        )
+    else:
+        await ws.accept()
+        log.warning("ws_phrase_stream.no_token", extra={"remote": ws.client})
+        await ws.close(code=4001, reason="JWT 누락")
+        return
+
+    # 2. JWT 검증
     try:
-        principal = decode_token(token)
+        principal = decode_token(token_value)
     except (pyjwt.PyJWTError, Exception):
         # decode_token 내부에서 HTTPException 발생 가능 → WS에서는 close로 처리
-        await ws.accept()
+        await ws.accept(subprotocol=accept_subprotocol)
         log.warning(
             "ws_phrase_stream.jwt_invalid",
             extra={"remote": ws.client},
@@ -66,8 +141,8 @@ async def ws_phrase_stream(
         await ws.close(code=4001, reason="JWT 인증 실패")
         return
 
-    # 2. WebSocket accept
-    await ws.accept()
+    # 3. WebSocket accept (서브프로토콜 echo)
+    await ws.accept(subprotocol=accept_subprotocol)
     log.info(
         "ws_phrase_stream.connected",
         extra={
@@ -75,6 +150,16 @@ async def ws_phrase_stream(
             "remote": ws.client,
         },
     )
+
+    # 2b. 환자당 동시 접속 cap. 초과 시 4003으로 거절.
+    patient_id_str = str(principal.patient_id)
+    if not await _try_acquire_slot(patient_id_str):
+        log.warning(
+            "ws_phrase_stream.conn_limit_exceeded",
+            extra={"patient_id": patient_id_str, "limit": MAX_CONN_PER_PATIENT},
+        )
+        await ws.close(code=4003, reason="동시 접속 한도 초과")
+        return
 
     # 3. 운영 ML 주소. 미설정/장애는 오류로 알리고 연결 종료는 프론트가 결정한다.
     ml_ws_url = settings.ml_asr_ws_url
@@ -94,7 +179,7 @@ async def ws_phrase_stream(
             "ws_phrase_stream.session_start_failed",
             extra={"patient_id": str(principal.patient_id)},
         )
-        await session._push_error("INTERNAL", "실시간 연결 초기화에 실패했습니다")
+        await session.push_error("INTERNAL", "실시간 연결 초기화에 실패했습니다")
 
     # 6. 메시지 루프
     try:
@@ -128,7 +213,7 @@ async def ws_phrase_stream(
                     "ws_phrase_stream.message_processing_error",
                     extra={"trace_id": session.trace_id},
                 )
-                await session._push_error("INTERNAL", "입력 처리 중 오류가 발생했습니다")
+                await session.push_error("INTERNAL", "입력 처리 중 오류가 발생했습니다")
 
     except WebSocketDisconnect:
         log.info(
@@ -148,7 +233,8 @@ async def ws_phrase_stream(
         )
     finally:
         # 7. 세션 정리 (idempotent — 이미 닫혔으면 no-op)
-        await session._close(code=1000)
+        await session.close(code=1000)
+        await _release_slot(patient_id_str)
         log.info(
             "ws_phrase_stream.session_ended",
             extra={

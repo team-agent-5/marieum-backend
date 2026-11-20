@@ -17,6 +17,15 @@ from app.config import settings
 from app.security import issue_token
 
 
+async def _recv_non_ping(ws, timeout: float = 2.0) -> dict:
+    """서버 keepalive ping(type='ping')은 건너뛰고 다음 유효 프레임을 반환."""
+    while True:
+        msg = json.loads(await asyncio.wait_for(ws.recv(), timeout))
+        if msg.get("type") == "ping":
+            continue
+        return msg
+
+
 @pytest.mark.asyncio
 async def test_ml_conversation_receives_multiple_finals_until_client_end():
     upstream_closed = asyncio.Event()
@@ -195,8 +204,8 @@ async def test_real_websocket_stays_open_through_idle_multiple_finals_and_end(mo
                 assert not upstream_closed.is_set()
                 for text in ["물 주세요", "문 열어 주세요"]:
                     await ws.send(b"\0\0" * 1600)
-                    interim = json.loads(await asyncio.wait_for(ws.recv(), 2))
-                    final = json.loads(await asyncio.wait_for(ws.recv(), 2))
+                    interim = await _recv_non_ping(ws)
+                    final = await _recv_non_ping(ws)
                     assert interim["text"] == final["text"] == text
                     assert interim["final"] is False
                     assert final["final"] is True
@@ -204,7 +213,7 @@ async def test_real_websocket_stays_open_through_idle_multiple_finals_and_end(mo
                     assert ws.state == State.OPEN
                     assert not upstream_closed.is_set()
                 await ws.send(json.dumps({"type": "end"}))
-                final = json.loads(await asyncio.wait_for(ws.recv(), 2))
+                final = await _recv_non_ping(ws)
                 assert final["text"] == "마지막 문장"
                 assert final["final"] is True
                 await asyncio.sleep(2.1)
