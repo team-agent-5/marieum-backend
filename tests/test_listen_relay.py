@@ -151,6 +151,8 @@ async def test_say_without_listen_session_returns_delivered_false() -> None:
         await session.start()
         try:
             await session.handle_client_message(_say_msg("u1"))
+            # audit은 fire-and-forget이라 다음 루프 tick에 실행된다.
+            await asyncio.sleep(0)
             saids = by_type(ws, "said")
             assert saids == [{"type": "said", "utterance_id": "u1", "delivered": False}]
             store.relay_say_to_listener.assert_not_called()
@@ -182,6 +184,7 @@ async def test_say_with_active_session_relays_and_delivers() -> None:
         await session.start()
         try:
             await session.handle_client_message(_say_msg("u2", "안녕"))
+            await asyncio.sleep(0)  # fire-and-forget audit 드레인
             store.relay_say_to_listener.assert_awaited_once_with(sess_obj, "u2", "안녕")
             store.record_utterance.assert_called_once_with(sess_obj, "u2", True)
             saids = by_type(ws, "said")

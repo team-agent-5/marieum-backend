@@ -197,7 +197,12 @@ async def test_ml_audio_limit_error_still_delivers_final() -> None:
         session, ws = make_session(proxy, correct=AsyncMock(return_value=("물", 0.99)))
         await session.start()
         await asyncio.wait_for(session._ml_event_task, 1)
-        messages = [call.args[0] for call in ws.send_json.call_args_list]
+        # listener 상태 알림(type=="listener")은 start() 직후 1회 송출되므로 필터.
+        messages = [
+            call.args[0]
+            for call in ws.send_json.call_args_list
+            if call.args[0].get("type") != "listener"
+        ]
         assert messages[0]["error_code"] == "AUDIO_TOO_LONG"
         assert messages[-1]["text"] == "물"
         assert messages[-1]["final"] is True
@@ -250,6 +255,11 @@ async def test_normal_ml_completion_is_not_reported_as_an_error():
         session, ws = make_session(proxy)
         await session.start()
         await asyncio.wait_for(session._ml_event_task, 1)
-        ws.send_json.assert_not_awaited()
+        # listener 상태 알림 외에 에러·transcript는 송출돼선 안 된다.
+        non_listener = [
+            call for call in ws.send_json.call_args_list
+            if call.args[0].get("type") != "listener"
+        ]
+        assert non_listener == []
         ws.close.assert_not_awaited()
         await session.handle_client_message('{"type":"close"}')

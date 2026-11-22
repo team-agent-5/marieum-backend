@@ -18,6 +18,15 @@ from app.config import settings
 from app.security import issue_token
 
 
+async def _recv_transcript(ws, timeout: float = 3.0) -> dict:
+    """keepalive ping / listener 상태 알림은 건너뛰고 다음 transcript/error 프레임만 반환."""
+    while True:
+        msg = json.loads(await asyncio.wait_for(ws.recv(), timeout))
+        if msg.get("type") in ("ping", "listener"):
+            continue
+        return msg
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "raws",
@@ -91,10 +100,10 @@ async def test_cumulative_ml_transcripts_reach_app_without_haiku(monkeypatch, ra
             ) as ws:
                 for raw in raws[:2]:
                     await ws.send(b"\x00\x00" * 1600)
-                    outputs.append(json.loads(await asyncio.wait_for(ws.recv(), 3)))
+                    outputs.append(await _recv_transcript(ws))
                     assert outputs[-1]["text"] == raw
                 await ws.send(json.dumps({"type": "end"}))
-                outputs.append(json.loads(await asyncio.wait_for(ws.recv(), 3)))
+                outputs.append(await _recv_transcript(ws))
                 await ws.send(json.dumps({"type": "close"}))
                 await asyncio.wait_for(ws.wait_closed(), 3)
                 assert ws.close_code == 1000

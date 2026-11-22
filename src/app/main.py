@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import logging
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
@@ -50,21 +52,14 @@ async def lifespan(app: FastAPI):
     app.state.catalog_embeddings = catalog
     log.info("Catalog cache loaded: %d phrases", len(catalog))
     # 3. Listen cleanup background task (grace expiry, TTL expiry).
-    try:
-        app.state.listen_cleanup_task = await listen_store.start_cleanup_task()
-    except NotImplementedError:
-        # store 구현 미완 상태에서도 앱은 떠야 함.
-        app.state.listen_cleanup_task = None
-        log.warning("listen.cleanup_task not available (store not implemented yet)")
+    app.state.listen_cleanup_task = await listen_store.start_cleanup_task()
     yield
     log.info("Shutting down.")
     task = getattr(app.state, "listen_cleanup_task", None)
     if task is not None:
         task.cancel()
-        try:
+        with contextlib.suppress(asyncio.CancelledError, Exception):
             await task
-        except BaseException:
-            pass
 
 
 # ────────── FastAPI 앱 ──────────

@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import secrets
 from collections import deque
 from dataclasses import dataclass, field
@@ -102,11 +103,19 @@ class SessionEndedError(Exception):
 
 _lock: asyncio.Lock = asyncio.Lock()
 
-_sessions_by_patient: dict[UUID, "ListenSession"] = {}
-_sessions_by_code: dict[str, "ListenSession"] = {}
-_sessions_by_token: dict[str, "ListenSession"] = {}
+# 비동기 백그라운드 task(revoke 시 WS close 등) 참조 보관. GC 방지.
+_background_tasks: set[asyncio.Task[None]] = set()
+
+_sessions_by_patient: dict[UUID, ListenSession] = {}
+_sessions_by_code: dict[str, ListenSession] = {}
+_sessions_by_token: dict[str, ListenSession] = {}
 
 _event_queues: dict[UUID, asyncio.Queue[str]] = {}
+_played_queues: dict[UUID, asyncio.Queue[str]] = {}
+
+# 환자 WS가 못 따라갈 때 상태/played 이벤트가 무제한 쌓이지 않도록 cap.
+# 환자 1명당 상태 전환은 몇 건 수준이라 16이면 충분. 초과 시 drop-oldest.
+EVENT_QUEUE_MAXSIZE = 16
 
 # IP → sliding window deque[monotonic timestamp]
 _rate_limit: dict[str, deque[float]] = {}
@@ -138,39 +147,45 @@ def _check_rate_limit(ip: str) -> None:
     dq.append(now_ts)
 
 
-def _free_indexes(session: "ListenSession") -> None:
+def _free_indexes(session: ListenSession) -> None:
     _sessions_by_patient.pop(session.patient_id, None)
     _sessions_by_code.pop(session.join_code, None)
     if session.listener_token:
         _sessions_by_token.pop(session.listener_token, None)
 
 
+def _enqueue_drop_oldest(q: asyncio.Queue[str], item: str) -> None:
+    """Bounded queue에 drop-oldest 전략으로 push."""
+    while q.full():
+        try:
+            q.get_nowait()
+        except asyncio.QueueEmpty:
+            break
+    with contextlib.suppress(asyncio.QueueFull):
+        q.put_nowait(item)
+
+
 async def _emit_event(patient_id: UUID, state: str) -> None:
     q = _event_queues.get(patient_id)
     if q is None:
         return
-    try:
-        q.put_nowait(state)
-    except asyncio.QueueFull:
-        pass
+    _enqueue_drop_oldest(q, state)
 
 
-async def _send_end_and_close(ws: "WebSocket", reason: str) -> None:
+async def _send_end_and_close(ws: WebSocket, reason: str) -> None:
     try:
         msg = WSListenSessionEndOut(type="session_end", reason=reason)  # type: ignore[arg-type]
         await ws.send_json(msg.model_dump(mode="json"))
     except Exception:
         pass
-    try:
+    with contextlib.suppress(Exception):
         await ws.close(code=4004, reason=reason)
-    except Exception:
-        pass
 
 
 # ────────── 공개 API ──────────
 
 
-def create_session(patient_id: UUID) -> "ListenSession":
+def create_session(patient_id: UUID) -> ListenSession:
     """환자용 세션을 새로 만든다.
 
     - 같은 환자의 기존 세션이 있으면 `end_session(..., "revoked")`로 종료 후 교체.
@@ -188,7 +203,9 @@ def create_session(patient_id: UUID) -> "ListenSession":
             try:
                 loop = asyncio.get_event_loop()
                 if loop.is_running():
-                    loop.create_task(_send_end_and_close(ws, "revoked"))
+                    bg = loop.create_task(_send_end_and_close(ws, "revoked"))
+                    _background_tasks.add(bg)
+                    bg.add_done_callback(_background_tasks.discard)
             except RuntimeError:
                 pass
 
@@ -211,28 +228,28 @@ def create_session(patient_id: UUID) -> "ListenSession":
     return session
 
 
-def get_by_patient(patient_id: UUID) -> "ListenSession | None":
+def get_by_patient(patient_id: UUID) -> ListenSession | None:
     s = _sessions_by_patient.get(patient_id)
     if s is None or s.ended:
         return None
     return s
 
 
-def get_by_join_code(code: str) -> "ListenSession | None":
+def get_by_join_code(code: str) -> ListenSession | None:
     s = _sessions_by_code.get(code)
     if s is None or s.ended:
         return None
     return s
 
 
-def get_by_listener_token(token: str) -> "ListenSession | None":
+def get_by_listener_token(token: str) -> ListenSession | None:
     s = _sessions_by_token.get(token)
     if s is None or s.ended:
         return None
     return s
 
 
-async def consume_join_code(code: str, ip: str) -> tuple["ListenSession", str]:
+async def consume_join_code(code: str, ip: str) -> tuple[ListenSession, str]:
     async with _lock:
         _check_rate_limit(ip)
 
@@ -254,7 +271,7 @@ async def consume_join_code(code: str, ip: str) -> tuple["ListenSession", str]:
         return session, token
 
 
-async def attach_listener(token: str, ws: "WebSocket") -> "ListenSession":
+async def attach_listener(token: str, ws: WebSocket) -> ListenSession:
     async with _lock:
         session = _sessions_by_token.get(token)
         if session is None or session.ended:
@@ -276,7 +293,7 @@ async def attach_listener(token: str, ws: "WebSocket") -> "ListenSession":
         return session
 
 
-async def detach_listener(session: "ListenSession", now_listener_left: bool = False) -> None:
+async def detach_listener(session: ListenSession, now_listener_left: bool = False) -> None:
     async with _lock:
         session.listener_ws = None
         if now_listener_left:
@@ -286,7 +303,7 @@ async def detach_listener(session: "ListenSession", now_listener_left: bool = Fa
             session.grace_until = _now() + timedelta(seconds=RECONNECT_GRACE_S)
 
 
-async def end_session(session: "ListenSession", reason: str) -> None:
+async def end_session(session: ListenSession, reason: str) -> None:
     if session.ended:
         return
     session.ended = True
@@ -298,7 +315,7 @@ async def end_session(session: "ListenSession", reason: str) -> None:
     _free_indexes(session)
 
 
-def record_utterance(session: "ListenSession", utterance_id: str, delivered: bool) -> None:
+def record_utterance(session: ListenSession, utterance_id: str, delivered: bool) -> None:
     if utterance_id in session.recent_utterances:
         return
     session.recent_utterances[utterance_id] = delivered
@@ -307,11 +324,11 @@ def record_utterance(session: "ListenSession", utterance_id: str, delivered: boo
         del session.recent_utterances[oldest]
 
 
-def lookup_utterance(session: "ListenSession", utterance_id: str) -> bool | None:
+def lookup_utterance(session: ListenSession, utterance_id: str) -> bool | None:
     return session.recent_utterances.get(utterance_id)
 
 
-def is_listener_active(session: "ListenSession") -> bool:
+def is_listener_active(session: ListenSession) -> bool:
     return session.listener_ws is not None and not session.ended
 
 
@@ -363,7 +380,7 @@ async def start_cleanup_task() -> asyncio.Task:
 
 
 async def relay_say_to_listener(
-    session: "ListenSession", utterance_id: str, text: str
+    session: ListenSession, utterance_id: str, text: str
 ) -> bool:
     ws = session.listener_ws
     if ws is None or session.ended:
@@ -390,13 +407,40 @@ async def relay_say_to_listener(
 async def subscribe_listener_events(patient_id: UUID) -> asyncio.Queue[str]:
     q = _event_queues.get(patient_id)
     if q is None:
-        q = asyncio.Queue()
+        q = asyncio.Queue(maxsize=EVENT_QUEUE_MAXSIZE)
         _event_queues[patient_id] = q
     return q
 
 
 async def unsubscribe_listener_events(patient_id: UUID) -> None:
     _event_queues.pop(patient_id, None)
+
+
+# ────────── Played 이벤트 (상대방→환자) ──────────
+
+
+async def subscribe_played_events(patient_id: UUID) -> asyncio.Queue[str]:
+    """환자 WS가 상대방 played 알림을 받기 위한 큐. 큐 메시지는 utterance_id."""
+    q = _played_queues.get(patient_id)
+    if q is None:
+        q = asyncio.Queue(maxsize=EVENT_QUEUE_MAXSIZE)
+        _played_queues[patient_id] = q
+    return q
+
+
+async def unsubscribe_played_events(patient_id: UUID) -> None:
+    _played_queues.pop(patient_id, None)
+
+
+def push_played_event(session: ListenSession, utterance_id: str) -> None:
+    """상대방이 played를 보냈을 때 환자 측 큐에 enqueue.
+
+    환자 WS가 구독 중이 아니면(queue 없음) 조용히 drop. drop-oldest 정책.
+    """
+    q = _played_queues.get(session.patient_id)
+    if q is None:
+        return
+    _enqueue_drop_oldest(q, utterance_id)
 
 
 # ────────── 테스트/lifespan 용 리셋 ──────────
@@ -408,4 +452,5 @@ def _reset_for_tests() -> None:
     _sessions_by_code.clear()
     _sessions_by_token.clear()
     _event_queues.clear()
+    _played_queues.clear()
     _rate_limit.clear()

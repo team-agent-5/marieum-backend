@@ -18,10 +18,10 @@ from app.security import issue_token
 
 
 async def _recv_non_ping(ws, timeout: float = 2.0) -> dict:
-    """서버 keepalive ping(type='ping')은 건너뛰고 다음 유효 프레임을 반환."""
+    """서버 keepalive ping/listener 상태 알림은 건너뛰고 다음 유효 프레임을 반환."""
     while True:
         msg = json.loads(await asyncio.wait_for(ws.recv(), timeout))
-        if msg.get("type") == "ping":
+        if msg.get("type") in ("ping", "listener"):
             continue
         return msg
 

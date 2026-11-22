@@ -308,12 +308,10 @@ async def ws_listen(ws: WebSocket) -> None:
     except store.ListenerAlreadyJoinedError:
         await ws.close(code=WS_CLOSE_ALREADY_JOINED, reason="이미 다른 상대방이 연결됨")
         return
-    except Exception as exc:
-        # SessionEndedError 또는 유사한 "세션 종료" 예외
-        name = type(exc).__name__
-        if "SessionEnded" in name or "NotFound" in name:
-            await ws.close(code=WS_CLOSE_SESSION_ENDED, reason="세션 종료됨")
-            return
+    except store.SessionEndedError:
+        await ws.close(code=WS_CLOSE_SESSION_ENDED, reason="세션 종료됨")
+        return
+    except Exception:
         log.exception("ws_listen.attach_failed")
         await ws.close(code=WS_CLOSE_SESSION_ENDED, reason="세션 초기화 실패")
         return
@@ -397,14 +395,10 @@ async def _ping_loop(ws: WebSocket) -> None:
 
 async def _handle_played(session, utterance_id: str) -> None:
     """상대방이 '재생 시작' 알림을 보냈을 때 환자 측으로 중계 + audit."""
-    push = getattr(store, "push_played_event", None)
-    if push is not None:
-        try:
-            result = push(session, utterance_id)
-            if asyncio.iscoroutine(result):
-                await result
-        except Exception:
-            log.exception("ws_listen.push_played_failed")
+    try:
+        store.push_played_event(session, utterance_id)
+    except Exception:
+        log.exception("ws_listen.push_played_failed")
 
     # 재생 이벤트 audit (text 없음).
     now_iso = datetime.now().astimezone().isoformat()

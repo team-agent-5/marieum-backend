@@ -30,6 +30,7 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 
 from fastapi import WebSocket, WebSocketDisconnect
+from pydantic import ValidationError
 
 from app.agent.streaming.ml_proxy import (
     MLProxyConnectionError,
@@ -40,8 +41,6 @@ from app.agent.streaming.pipeline import (
     StreamingPipeline,
     StreamingSessionState,
 )
-from pydantic import ValidationError
-
 from app.audit import audit_append
 from app.config import settings
 from app.db import AsyncSessionLocal
@@ -456,6 +455,15 @@ class StreamingSession:
                 extra={"trace_id": self.trace_id, "event": event},
             )
 
+    def _fire_audit(self, event: str, payload: dict[str, Any]) -> None:
+        """Hot path 용 fire-and-forget audit. DB 라운드트립이 say 응답을 지연시키지
+        않도록 백그라운드 태스크로 발사. 태스크 참조는 self._audit_tasks에 보관해 GC 방지."""
+        if not hasattr(self, "_audit_tasks"):
+            self._audit_tasks: set[asyncio.Task[None]] = set()
+        task = asyncio.create_task(self._audit(event, payload))
+        self._audit_tasks.add(task)
+        task.add_done_callback(self._audit_tasks.discard)
+
     async def _keepalive_loop(self) -> None:
         """Cloudflare 100s idle 방지용 서버→클라 ping. 클라는 무시해도 무방."""
         while not self._closed:
@@ -606,7 +614,8 @@ class StreamingSession:
 
         if session is None or getattr(session, "ended", False):
             delivered = False
-            await self._audit(
+            # Hot path: fire-and-forget. DB 라운드트립이 said 응답을 지연시키지 않도록.
+            self._fire_audit(
                 "listen_say",
                 {
                     "utterance_id": uid,
@@ -655,7 +664,8 @@ class StreamingSession:
                 exc_info=True,
             )
 
-        await self._audit(
+        # Hot path: fire-and-forget. 상대방 수신 p95 300ms 목표 유지용.
+        self._fire_audit(
             "listen_say",
             {
                 "utterance_id": uid,
