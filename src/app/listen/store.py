@@ -21,10 +21,14 @@
 from __future__ import annotations
 
 import asyncio
+import secrets
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import TYPE_CHECKING
 from uuid import UUID
+
+from app.schemas import WSListenSayOut, WSListenSessionEndOut
 
 if TYPE_CHECKING:
     from fastapi import WebSocket
@@ -44,6 +48,9 @@ MAX_JOIN_CODE_RETRIES = 8
 
 # IP당 /listen/join 분당 허용 횟수.
 JOIN_RATE_LIMIT_PER_MIN = 10
+RATE_LIMIT_WINDOW_S = 60
+
+CLEANUP_INTERVAL_S = 10
 
 
 # ────────── 데이터 ──────────
@@ -87,155 +94,318 @@ class RateLimitedError(Exception):
     """IP 분당 시도 한도 초과 → 429 RATE_LIMITED."""
 
 
-# ────────── 공개 API — 구현 Agent가 채운다 ──────────
+class SessionEndedError(Exception):
+    """세션이 존재하지 않거나 종료됨 → 라우터는 close(4004)로 처리."""
 
 
-_lock: asyncio.Lock  # 모듈 전역 락. 초기화는 구현부에서.
+# ────────── 내부 상태 ──────────
+
+_lock: asyncio.Lock = asyncio.Lock()
+
+_sessions_by_patient: dict[UUID, "ListenSession"] = {}
+_sessions_by_code: dict[str, "ListenSession"] = {}
+_sessions_by_token: dict[str, "ListenSession"] = {}
+
+_event_queues: dict[UUID, asyncio.Queue[str]] = {}
+
+# IP → sliding window deque[monotonic timestamp]
+_rate_limit: dict[str, deque[float]] = {}
 
 
-def create_session(patient_id: UUID) -> ListenSession:
+def _now() -> datetime:
+    return datetime.now().astimezone()
+
+
+def _gen_join_code() -> str:
+    return "".join(secrets.choice(JOIN_CODE_CHARSET) for _ in range(JOIN_CODE_LEN))
+
+
+def _gen_session_id() -> str:
+    return "ls_" + secrets.token_urlsafe(10)
+
+
+def _check_rate_limit(ip: str) -> None:
+    """Sliding 1-min window. All attempts count (brute-force deterrent)."""
+    loop = asyncio.get_event_loop()
+    now_ts = loop.time()
+    dq = _rate_limit.setdefault(ip, deque())
+    cutoff = now_ts - RATE_LIMIT_WINDOW_S
+    while dq and dq[0] < cutoff:
+        dq.popleft()
+    if len(dq) >= JOIN_RATE_LIMIT_PER_MIN:
+        dq.append(now_ts)
+        raise RateLimitedError("join rate limit exceeded")
+    dq.append(now_ts)
+
+
+def _free_indexes(session: "ListenSession") -> None:
+    _sessions_by_patient.pop(session.patient_id, None)
+    _sessions_by_code.pop(session.join_code, None)
+    if session.listener_token:
+        _sessions_by_token.pop(session.listener_token, None)
+
+
+async def _emit_event(patient_id: UUID, state: str) -> None:
+    q = _event_queues.get(patient_id)
+    if q is None:
+        return
+    try:
+        q.put_nowait(state)
+    except asyncio.QueueFull:
+        pass
+
+
+async def _send_end_and_close(ws: "WebSocket", reason: str) -> None:
+    try:
+        msg = WSListenSessionEndOut(type="session_end", reason=reason)  # type: ignore[arg-type]
+        await ws.send_json(msg.model_dump(mode="json"))
+    except Exception:
+        pass
+    try:
+        await ws.close(code=4004, reason=reason)
+    except Exception:
+        pass
+
+
+# ────────── 공개 API ──────────
+
+
+def create_session(patient_id: UUID) -> "ListenSession":
     """환자용 세션을 새로 만든다.
 
     - 같은 환자의 기존 세션이 있으면 `end_session(..., "revoked")`로 종료 후 교체.
     - 교체 시 기존 세션의 listener_ws에게 `WSListenSessionEndOut(reason="revoked")` 전송 후 close(4004).
     - 신규 join_code 발급 (충돌 시 재시도).
     """
-    raise NotImplementedError
+    existing = _sessions_by_patient.get(patient_id)
+    if existing is not None and not existing.ended:
+        ws = existing.listener_ws
+        existing.ended = True
+        existing.end_reason = "revoked"
+        existing.listener_ws = None
+        _free_indexes(existing)
+        if ws is not None:
+            try:
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    loop.create_task(_send_end_and_close(ws, "revoked"))
+            except RuntimeError:
+                pass
+
+    code = ""
+    for _ in range(MAX_JOIN_CODE_RETRIES):
+        candidate = _gen_join_code()
+        if candidate not in _sessions_by_code:
+            code = candidate
+            break
+    if not code:
+        code = _gen_join_code()
+
+    session = ListenSession(
+        listen_session_id=_gen_session_id(),
+        patient_id=patient_id,
+        join_code=code,
+    )
+    _sessions_by_patient[patient_id] = session
+    _sessions_by_code[code] = session
+    return session
 
 
-def get_by_patient(patient_id: UUID) -> ListenSession | None:
-    """환자의 현재 세션. 없거나 ended이면 None."""
-    raise NotImplementedError
+def get_by_patient(patient_id: UUID) -> "ListenSession | None":
+    s = _sessions_by_patient.get(patient_id)
+    if s is None or s.ended:
+        return None
+    return s
 
 
-def get_by_join_code(code: str) -> ListenSession | None:
-    """코드로 조회. 소비됐거나 join 만료됐으면 None (혹은 반환하되 호출자가 체크)."""
-    raise NotImplementedError
+def get_by_join_code(code: str) -> "ListenSession | None":
+    s = _sessions_by_code.get(code)
+    if s is None or s.ended:
+        return None
+    return s
 
 
-def get_by_listener_token(token: str) -> ListenSession | None:
-    """토큰으로 조회. ended면 None."""
-    raise NotImplementedError
+def get_by_listener_token(token: str) -> "ListenSession | None":
+    s = _sessions_by_token.get(token)
+    if s is None or s.ended:
+        return None
+    return s
 
 
-async def consume_join_code(code: str, ip: str) -> tuple[ListenSession, str]:
-    """`/listen/join` 메인 로직. 코드 → listener_token 교환.
+async def consume_join_code(code: str, ip: str) -> tuple["ListenSession", str]:
+    async with _lock:
+        _check_rate_limit(ip)
 
-    정상:
-        - join_code_consumed=True 세팅, listener_token 발급 후 반환.
-    예외:
-        - JoinCodeInvalidError: 코드 없음 / 소비됨 / join_expires_at 경과.
-        - ListenerAlreadyJoinedError: 이미 연결됨 OR grace 중.
-        - RateLimitedError: IP 분당 10회 초과.
+        session = _sessions_by_code.get(code)
+        if session is None or session.ended or session.join_code_consumed:
+            raise JoinCodeInvalidError("invalid or consumed join code")
+        if _now() >= session.join_expires_at:
+            raise JoinCodeInvalidError("join code expired")
 
-    rate limit은 **실패 시도**에 대해서만 카운트하는 게 아니라 **모든 시도** 카운트
-    (브루트포스 대응). IP별 슬라이딩 1분 윈도우.
-    """
-    raise NotImplementedError
+        if session.listener_ws is not None:
+            raise ListenerAlreadyJoinedError("listener already attached")
+        if session.grace_until is not None and _now() < session.grace_until:
+            raise ListenerAlreadyJoinedError("listener in grace reconnect window")
 
-
-async def attach_listener(token: str, ws: WebSocket) -> ListenSession:
-    """상대방 WS 연결 시 세션에 바인딩.
-
-    - 세션 없거나 ended → close code 4004 유발 (예외 발생).
-    - 이미 다른 listener_ws가 활성이면 close code 4009 (예외 발생).
-    - grace 중이면 grace 해제 후 재바인딩 (listener:joined 재통지 안 함 — 내부 리커넥).
-    """
-    raise NotImplementedError
+        token = secrets.token_urlsafe(LISTENER_TOKEN_BYTES)
+        session.join_code_consumed = True
+        session.listener_token = token
+        _sessions_by_token[token] = session
+        return session, token
 
 
-async def detach_listener(session: ListenSession, now_listener_left: bool = False) -> None:
-    """상대방 WS 끊김.
+async def attach_listener(token: str, ws: "WebSocket") -> "ListenSession":
+    async with _lock:
+        session = _sessions_by_token.get(token)
+        if session is None or session.ended:
+            raise SessionEndedError("session not found or ended")
 
-    - now_listener_left=True면 즉시 "left" 상태로 전환 (grace 생략).
-    - False면 RECONNECT_GRACE_S 초 동안 재접속 허용. 만료 시 "left" 전이.
-    """
-    raise NotImplementedError
+        if session.listener_ws is not None:
+            raise ListenerAlreadyJoinedError("another listener socket attached")
 
+        # Grace reconnect: do NOT re-emit "joined"
+        if session.grace_until is not None and _now() < session.grace_until:
+            session.listener_ws = ws
+            session.grace_until = None
+            return session
 
-async def end_session(session: ListenSession, reason: str) -> None:
-    """세션 종료. 멱등.
-
-    - ended=True, end_reason 세팅.
-    - listener_ws가 있으면 WSListenSessionEndOut 전송 + close(4004).
-    - 인덱스에서 제거는 cleanup task가 처리 (즉시 삭제도 가능).
-    """
-    raise NotImplementedError
-
-
-def record_utterance(session: ListenSession, utterance_id: str, delivered: bool) -> None:
-    """utterance 결과를 멱등 캐시에 기록.
-
-    - 캐시 크기 UTTERANCE_DEDUP_WINDOW 초과 시 가장 오래된 항목 제거.
-    - 이미 있으면 덮어쓰지 않는다 (첫 결과 유지).
-    """
-    raise NotImplementedError
+        # Fresh join
+        session.listener_ws = ws
+        session.grace_until = None
+        await _emit_event(session.patient_id, "joined")
+        return session
 
 
-def lookup_utterance(session: ListenSession, utterance_id: str) -> bool | None:
-    """멱등 조회. 캐시에 있으면 저장된 delivered 반환, 없으면 None."""
-    raise NotImplementedError
+async def detach_listener(session: "ListenSession", now_listener_left: bool = False) -> None:
+    async with _lock:
+        session.listener_ws = None
+        if now_listener_left:
+            session.grace_until = None
+            await _emit_event(session.patient_id, "left")
+        else:
+            session.grace_until = _now() + timedelta(seconds=RECONNECT_GRACE_S)
 
 
-def is_listener_active(session: ListenSession) -> bool:
-    """상대방이 실제로 소켓을 잡고 있나? grace 중이면 False.
+async def end_session(session: "ListenSession", reason: str) -> None:
+    if session.ended:
+        return
+    session.ended = True
+    session.end_reason = reason
+    ws = session.listener_ws
+    session.listener_ws = None
+    if ws is not None:
+        await _send_end_and_close(ws, reason)
+    _free_indexes(session)
 
-    `say` 처리에서 `delivered` 판정에 사용.
-    """
-    raise NotImplementedError
+
+def record_utterance(session: "ListenSession", utterance_id: str, delivered: bool) -> None:
+    if utterance_id in session.recent_utterances:
+        return
+    session.recent_utterances[utterance_id] = delivered
+    while len(session.recent_utterances) > UTTERANCE_DEDUP_WINDOW:
+        oldest = next(iter(session.recent_utterances))
+        del session.recent_utterances[oldest]
+
+
+def lookup_utterance(session: "ListenSession", utterance_id: str) -> bool | None:
+    return session.recent_utterances.get(utterance_id)
+
+
+def is_listener_active(session: "ListenSession") -> bool:
+    return session.listener_ws is not None and not session.ended
 
 
 # ────────── Background cleanup ──────────
 
 
+async def _cleanup_once() -> None:
+    now = _now()
+    to_end: list[ListenSession] = []
+    to_mark_left: list[ListenSession] = []
+    async with _lock:
+        for session in list(_sessions_by_patient.values()):
+            if session.ended:
+                continue
+            if (
+                session.listener_ws is None
+                and session.grace_until is not None
+                and now >= session.grace_until
+            ):
+                session.grace_until = None
+                to_mark_left.append(session)
+            if now >= session.expires_at:
+                to_end.append(session)
+
+    for session in to_mark_left:
+        await _emit_event(session.patient_id, "left")
+
+    for session in to_end:
+        await end_session(session, "expired")
+
+
+async def _cleanup_loop() -> None:
+    while True:
+        try:
+            await asyncio.sleep(CLEANUP_INTERVAL_S)
+            await _cleanup_once()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # 루프는 죽이지 않는다.
+            continue
+
+
 async def start_cleanup_task() -> asyncio.Task:
-    """주기적으로 만료 세션/grace 만료를 정리하는 백그라운드 태스크를 띄운다.
-
-    - 10초 주기 권장.
-    - grace_until이 지난 세션: listener:left 상태로 전이 (환자 WS에 통지는 streaming/session.py 담당).
-    - expires_at이 지난 세션: end_session(session, "expired") 호출.
-    - 반환된 태스크는 lifespan 종료 시 cancel 되어야 함.
-
-    구현 메모:
-    - 환자 WS로 listener 상태 변경 통지는 콜백 주입 방식 또는 store가 큐/이벤트로 노출.
-      구현 Agent가 가장 간단한 방식 선택 (예: 세션에 asyncio.Queue를 두어 streaming이 소비).
-    """
-    raise NotImplementedError
+    return asyncio.create_task(_cleanup_loop())
 
 
 # ────────── 환자↔상대방 중계 지원 ──────────
 
 
-async def relay_say_to_listener(session: ListenSession, utterance_id: str, text: str) -> bool:
-    """환자 app의 WSSayIn을 상대방에게 WSListenSayOut으로 전달.
-
-    반환:
-        True — 상대방 WS에 성공적으로 send.
-        False — 상대방 WS가 없거나 send 실패 (grace, ended, close race 등).
-
-    주의:
-        - server_ts는 이 함수가 결정 (datetime.now().astimezone().isoformat()).
-        - send 실패는 조용히 False 반환 (상대방 측 cleanup은 WS 수신 루프가 처리).
-    """
-    raise NotImplementedError
+async def relay_say_to_listener(
+    session: "ListenSession", utterance_id: str, text: str
+) -> bool:
+    ws = session.listener_ws
+    if ws is None or session.ended:
+        record_utterance(session, utterance_id, False)
+        return False
+    try:
+        msg = WSListenSayOut(
+            type="say",  # type: ignore[arg-type]
+            utterance_id=utterance_id,
+            text=text,
+            server_ts=_now().isoformat(),
+        )
+        await ws.send_json(msg.model_dump(mode="json"))
+        record_utterance(session, utterance_id, True)
+        return True
+    except Exception:
+        record_utterance(session, utterance_id, False)
+        return False
 
 
 # ────────── Listener 상태 이벤트 (환자 WS로 전파용) ──────────
 
 
 async def subscribe_listener_events(patient_id: UUID) -> asyncio.Queue[str]:
-    """환자 WS가 listen 상태 변화를 수신하기 위한 큐를 받는다.
-
-    큐 메시지는 ListenerState 문자열 ("joined" | "left" | "none").
-    환자 WS가 끊기면 unsubscribe로 정리.
-
-    구현 Agent 참고:
-    - 환자 1명당 큐 1개로 충분 (환자 WS도 1개 cap).
-    - 이미 subscribe돼 있으면 같은 큐 반환 or 새로 교체 — 구현자 재량.
-    """
-    raise NotImplementedError
+    q = _event_queues.get(patient_id)
+    if q is None:
+        q = asyncio.Queue()
+        _event_queues[patient_id] = q
+    return q
 
 
 async def unsubscribe_listener_events(patient_id: UUID) -> None:
-    """환자 WS 종료 시 호출."""
-    raise NotImplementedError
+    _event_queues.pop(patient_id, None)
+
+
+# ────────── 테스트/lifespan 용 리셋 ──────────
+
+
+def _reset_for_tests() -> None:
+    """모든 모듈 전역 상태 초기화. 테스트 전용."""
+    _sessions_by_patient.clear()
+    _sessions_by_code.clear()
+    _sessions_by_token.clear()
+    _event_queues.clear()
+    _rate_limit.clear()
