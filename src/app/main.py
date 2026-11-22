@@ -13,6 +13,8 @@ from app.agent.streaming.router import router as streaming_router
 from app.api import auth, patient, phrase
 from app.config import settings
 from app.errors import install as install_error_handlers
+from app.listen import router as listen_router
+from app.listen import store as listen_store
 from app.middleware import ServerVersionMiddleware, TraceIdMiddleware
 from app.schemas import HealthzResponse
 
@@ -47,8 +49,22 @@ async def lifespan(app: FastAPI):
             catalog[r.id] = {"text": r.text, "embedding": list(r.embedding) if r.embedding is not None else None}
     app.state.catalog_embeddings = catalog
     log.info("Catalog cache loaded: %d phrases", len(catalog))
+    # 3. Listen cleanup background task (grace expiry, TTL expiry).
+    try:
+        app.state.listen_cleanup_task = await listen_store.start_cleanup_task()
+    except NotImplementedError:
+        # store 구현 미완 상태에서도 앱은 떠야 함.
+        app.state.listen_cleanup_task = None
+        log.warning("listen.cleanup_task not available (store not implemented yet)")
     yield
     log.info("Shutting down.")
+    task = getattr(app.state, "listen_cleanup_task", None)
+    if task is not None:
+        task.cancel()
+        try:
+            await task
+        except BaseException:
+            pass
 
 
 # ────────── FastAPI 앱 ──────────
@@ -185,6 +201,7 @@ app.include_router(auth.router)
 app.include_router(patient.router)
 app.include_router(phrase.router)
 app.include_router(streaming_router)
+app.include_router(listen_router.router)
 
 
 # ────────── System ──────────
