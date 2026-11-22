@@ -782,6 +782,172 @@ WSServerMessage = Annotated[
 """
 
 
+# ────────── 상대방 폰 듣기 (Listen) — WS 메시지 ──────────
+#
+# 환자 WS(/ws/phrase/stream)에 추가되는 메시지와 상대방 WS(/ws/listen) 전용 메시지를
+# 분리해서 정의. 두 WS는 서브프로토콜, 인증 토큰 네임스페이스, 메모리 store만 공유.
+#
+# 설계: docs/handoff/ 2026-11-22 (프론트 피드백 v0.3)
+
+
+# 앱 → 서버 (기존 /ws/phrase/stream 에 추가)
+class WSSayIn(BaseModel):
+    """환자 앱이 확정 문장을 상대방에게 보내 달라고 요청.
+
+    - app이 ASR final을 거르고(의미 없는 조각 제외) 보낸 문장만 전달됨.
+    - utterance_id는 app이 생성(ULID/UUID 등). 멱등 키 역할.
+    - client_ts는 app의 monotonic/wall clock 시각(ISO8601). audit 지연 분석용.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+    type: Literal["say"] = Field(description="고정.")
+    utterance_id: str = Field(min_length=1, max_length=64, description="app 발급 ULID/UUID. 멱등 키.")
+    text: str = Field(min_length=1, max_length=400, description="상대방에게 읽힐 문자열.")
+    trace_id: str = Field(description="실시간 WS 세션 trace_id.")
+    client_ts: str = Field(description="app 측 송신 시각 (ISO8601).")
+
+
+# 서버 → 앱
+class WSSaidOut(BaseModel):
+    """say 당 1회. delivered=false면 app은 즉시 환자 폰 로컬 TTS로 fallback."""
+
+    model_config = ConfigDict(extra="forbid")
+    type: Literal["said"] = Field(description="고정.")
+    utterance_id: str = Field(description="요청과 동일한 id.")
+    delivered: bool = Field(description="상대방 WS에 전송 성공 여부.")
+
+
+class WSPlayedOut(BaseModel):
+    """상대방 브라우저/앱이 실제로 재생을 시작했을 때 app에 중계."""
+
+    model_config = ConfigDict(extra="forbid")
+    type: Literal["played"] = Field(description="고정.")
+    utterance_id: str = Field(description="재생한 utterance의 id.")
+
+
+ListenerState = Literal["joined", "left", "none"]
+"""상대방 연결 상태.
+
+- `joined`: 상대방 WS 연결됨 (또는 30s grace 중).
+- `left`: 30s grace 만료 or 명시적 종료.
+- `none`: 아직 상대방이 join하지 않음.
+"""
+
+
+class WSListenerStateOut(BaseModel):
+    """WS 연결 직후 1회 + 상태 변경 시 1회."""
+
+    model_config = ConfigDict(extra="forbid")
+    type: Literal["listener"] = Field(description="고정.")
+    state: ListenerState = Field(description="joined | left | none.")
+
+
+# ────────── 상대방 WS (/ws/listen) 전용 ──────────
+
+
+class WSListenSayOut(BaseModel):
+    """서버→상대: 환자가 보낸 문장. speechSynthesis로 재생."""
+
+    model_config = ConfigDict(extra="forbid")
+    type: Literal["say"] = Field(description="고정.")
+    utterance_id: str = Field(description="app이 발급한 id. played 응답 시 그대로 반환.")
+    text: str = Field(min_length=1, max_length=400, description="읽을 문자열.")
+    server_ts: str = Field(description="서버 송신 시각 (ISO8601).")
+
+
+class WSListenPingOut(BaseModel):
+    """서버→상대: CF idle 방지 keepalive. 상대 앱은 무시 가능."""
+
+    model_config = ConfigDict(extra="forbid")
+    type: Literal["ping"] = Field(description="고정.")
+
+
+ListenSessionEndReason = Literal["patient_left", "expired", "revoked"]
+"""상대방 세션 종료 원인.
+
+- `patient_left`: 환자가 실시간 모드 종료 or 명시적 연결 끊기.
+- `expired`: 세션 TTL(기본 2h) 초과.
+- `revoked`: 환자가 duplicate 세션 생성해 기존 세션 자동 종료.
+"""
+
+
+class WSListenSessionEndOut(BaseModel):
+    """서버→상대: 세션 종료. 뒤이어 WS가 close(1000) 됨."""
+
+    model_config = ConfigDict(extra="forbid")
+    type: Literal["session_end"] = Field(description="고정.")
+    reason: ListenSessionEndReason = Field(description="patient_left | expired | revoked.")
+
+
+class WSListenPlayedIn(BaseModel):
+    """상대→서버: 재생 시작 알림. 서버가 app에 WSPlayedOut으로 중계."""
+
+    model_config = ConfigDict(extra="forbid")
+    type: Literal["played"] = Field(description="고정.")
+    utterance_id: str = Field(description="재생한 utterance id.")
+
+
+WSListenServerMessage = Annotated[
+    WSListenSayOut | WSListenPingOut | WSListenSessionEndOut,
+    Field(discriminator="type"),
+]
+"""서버→상대 메시지 discriminated Union."""
+
+
+# ────────── 상대방 Listen HTTP 스키마 ──────────
+
+
+class CreateListenSessionResponse(BaseModel):
+    """POST /listen/sessions 응답. 환자 1명당 1개만 유지."""
+
+    model_config = ConfigDict(extra="forbid")
+    listen_session_id: str = Field(description="서버 발급 id (ls_<ulid>).")
+    join_code: str = Field(
+        min_length=6, max_length=6,
+        description="6자. 0/O/1/I 제외한 Crockford-style charset. 1회용.",
+    )
+    join_expires_at: datetime = Field(description="참여 가능 마감 (기본 +10분).")
+    expires_at: datetime = Field(description="세션 전체 만료 (기본 +2시간).")
+
+
+ListenSessionState = Literal["waiting", "connected", "ended"]
+"""환자 관점 세션 상태.
+
+- `waiting`: 아직 상대방 join 안 함.
+- `connected`: 상대방 WS 활성 (grace 중 포함).
+- `ended`: 만료·수동 종료.
+"""
+
+
+class CurrentListenSessionResponse(BaseModel):
+    """GET /listen/sessions/current 응답."""
+
+    model_config = ConfigDict(extra="forbid")
+    listen_session_id: str
+    state: ListenSessionState
+    join_code: str | None = Field(
+        default=None,
+        description="state=waiting일 때만 포함. 소비/만료되면 null.",
+    )
+    join_expires_at: datetime | None = None
+    expires_at: datetime
+
+
+class JoinRequest(BaseModel):
+    """POST /listen/join 요청."""
+
+    model_config = ConfigDict(extra="forbid")
+    join_code: str = Field(min_length=6, max_length=6, description="환자 앱에서 전달받은 코드.")
+
+
+class JoinResponse(BaseModel):
+    """POST /listen/join 응답."""
+
+    model_config = ConfigDict(extra="forbid")
+    listener_token: str = Field(min_length=20, description="/ws/listen 서브프로토콜 토큰.")
+    expires_at: datetime = Field(description="세션 expires_at과 동일.")
+
+
 __all__ = [
     "TTS_RATE_MAP",
     "TTS_VOLUME_MAP",
@@ -824,6 +990,13 @@ __all__ = [
     "TtsRate",
     "TtsVolume",
     # Streaming WS (S16 실시간 모드)
+    "CreateListenSessionResponse",
+    "CurrentListenSessionResponse",
+    "JoinRequest",
+    "JoinResponse",
+    "ListenerState",
+    "ListenSessionEndReason",
+    "ListenSessionState",
     "WSAudioIn",
     "WSCancelIn",
     "WSClientMessage",
@@ -832,7 +1005,16 @@ __all__ = [
     "WSEndIn",
     "WSErrorCode",
     "WSErrorOut",
+    "WSListenPingOut",
+    "WSListenPlayedIn",
+    "WSListenSayOut",
+    "WSListenServerMessage",
+    "WSListenSessionEndOut",
+    "WSListenerStateOut",
     "WSPingOut",
+    "WSPlayedOut",
+    "WSSaidOut",
+    "WSSayIn",
     "WSServerMessage",
     "WSSessionEndOut",
     "WSTranscriptOut",
