@@ -40,12 +40,19 @@ from app.agent.streaming.pipeline import (
     StreamingPipeline,
     StreamingSessionState,
 )
+from pydantic import ValidationError
+
 from app.audit import audit_append
 from app.config import settings
 from app.db import AsyncSessionLocal
+from app.listen import store as listen_store
 from app.schemas import (
     PatientPrincipal,
     WSErrorOut,
+    WSListenerStateOut,
+    WSPlayedOut,
+    WSSaidOut,
+    WSSayIn,
     WSSessionEndOut,
     WSTranscriptOut,
 )
@@ -111,6 +118,10 @@ class StreamingSession:
         self._segment_id: int | None = None
         self._closed: bool = False
 
+        # Listen 기능 (v0.3): 상대방 상태 이벤트/재생 이벤트 수신 백그라운드 태스크.
+        self._listener_event_task: asyncio.Task[None] | None = None
+        self._played_event_task: asyncio.Task[None] | None = None
+
         # Audit: 접속 시각(monotonic), 송신 바이트, final 횟수, close 코드
         self._started_at: float = time.monotonic()
         self._bytes_received: int = 0
@@ -161,6 +172,11 @@ class StreamingSession:
 
         self._ml_available = True
         await self._select_segment(0)
+
+        # Listen: 상대방 상태/재생 이벤트 구독 및 초기 상태 1회 통지.
+        # ML event task 시작 전에 수행해 transcript보다 먼저 listener 상태를 전달한다.
+        await self._start_listen_subscriptions()
+
         self._ml_event_task = asyncio.create_task(self._ml_event_loop())
 
         log.info(
@@ -241,6 +257,9 @@ class StreamingSession:
         if mtype == "end":
             await self._end_input()
             return True  # final을 기다리되 앱/ML 연결은 닫지 않는다.
+        elif mtype == "say":
+            await self._handle_say(data)
+            return True
         elif mtype in ("close", "cancel"):
             await self._close(code=1001 if mtype == "cancel" else 1000)
             return False
@@ -471,10 +490,195 @@ class StreamingSession:
             else:
                 self._schedule_reconnect()
 
+    # ── Listen (v0.3): say 중계 + listener/played 이벤트 전파 ────────────────
+
+    async def _start_listen_subscriptions(self) -> None:
+        """상대방 상태/재생 이벤트 큐 구독 + 초기 listener 상태 1회 통지.
+
+        Agent A가 store helper를 아직 못 채웠더라도 import/런타임 모두 생존하도록
+        hasattr/try-except로 가드한다.
+        """
+        # 초기 listener 상태 1회.
+        try:
+            session = listen_store.get_by_patient(self.patient_principal.patient_id)
+        except Exception:
+            log.warning(
+                "streaming_session.listen_initial_state_failed",
+                extra={"trace_id": self.trace_id},
+                exc_info=True,
+            )
+            session = None
+        state = "joined" if session is not None and not getattr(session, "ended", False) else "none"
+        await self._push_listener_state(state)
+
+        # listener 상태 큐 구독.
+        if hasattr(listen_store, "subscribe_listener_events"):
+            try:
+                queue = await listen_store.subscribe_listener_events(
+                    self.patient_principal.patient_id
+                )
+                self._listener_event_task = asyncio.create_task(
+                    self._listener_event_loop(queue)
+                )
+            except Exception:
+                log.warning(
+                    "streaming_session.subscribe_listener_events_failed",
+                    extra={"trace_id": self.trace_id},
+                    exc_info=True,
+                )
+
+        # played 이벤트 큐 구독 (Agent A가 아직 미구현일 수 있음).
+        if hasattr(listen_store, "subscribe_played_events"):
+            try:
+                queue = await listen_store.subscribe_played_events(
+                    self.patient_principal.patient_id
+                )
+                self._played_event_task = asyncio.create_task(self._played_event_loop(queue))
+            except Exception:
+                log.warning(
+                    "streaming_session.subscribe_played_events_failed",
+                    extra={"trace_id": self.trace_id},
+                    exc_info=True,
+                )
+
+    async def _listener_event_loop(self, queue: asyncio.Queue[str]) -> None:
+        try:
+            while not self._closed:
+                state = await queue.get()
+                if self._closed:
+                    return
+                await self._push_listener_state(state)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception(
+                "streaming_session.listener_event_loop_crashed",
+                extra={"trace_id": self.trace_id},
+            )
+
+    async def _played_event_loop(self, queue: asyncio.Queue[str]) -> None:
+        try:
+            while not self._closed:
+                uid = await queue.get()
+                if self._closed:
+                    return
+                await self._push_message(WSPlayedOut(type="played", utterance_id=uid))
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception(
+                "streaming_session.played_event_loop_crashed",
+                extra={"trace_id": self.trace_id},
+            )
+
+    async def _push_listener_state(self, state: str) -> None:
+        try:
+            msg = WSListenerStateOut(type="listener", state=state)  # type: ignore[arg-type]
+        except ValidationError:
+            log.warning(
+                "streaming_session.invalid_listener_state",
+                extra={"trace_id": self.trace_id, "state": state},
+            )
+            return
+        await self._push_message(msg)
+
+    async def _handle_say(self, data: dict[str, Any]) -> None:
+        try:
+            payload = WSSayIn.model_validate(data)
+        except ValidationError:
+            await self._push_error("INTERNAL", "say 요청 형식 오류")
+            return
+
+        uid = payload.utterance_id
+        text = payload.text
+        text_len = len(text)
+        client_ts = payload.client_ts
+        server_ts = time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime())
+
+        try:
+            session = listen_store.get_by_patient(self.patient_principal.patient_id)
+        except Exception:
+            log.exception(
+                "streaming_session.listen_get_session_failed",
+                extra={"trace_id": self.trace_id},
+            )
+            session = None
+
+        if session is None or getattr(session, "ended", False):
+            delivered = False
+            await self._audit(
+                "listen_say",
+                {
+                    "utterance_id": uid,
+                    "client_ts": client_ts,
+                    "server_ts": server_ts,
+                    "delivered": delivered,
+                    "text_len": text_len,
+                },
+            )
+            await self._push_message(
+                WSSaidOut(type="said", utterance_id=uid, delivered=delivered)
+            )
+            return
+
+        # 멱등 검사. 이미 처리한 utterance_id면 저장된 결과를 다시 돌려주고 끝낸다.
+        prior: bool | None = None
+        try:
+            prior = listen_store.lookup_utterance(session, uid)
+        except Exception:
+            log.warning(
+                "streaming_session.lookup_utterance_failed",
+                extra={"trace_id": self.trace_id},
+                exc_info=True,
+            )
+        if prior is not None:
+            await self._push_message(
+                WSSaidOut(type="said", utterance_id=uid, delivered=prior)
+            )
+            return
+
+        try:
+            delivered = await listen_store.relay_say_to_listener(session, uid, text)
+        except Exception:
+            log.exception(
+                "streaming_session.relay_say_failed",
+                extra={"trace_id": self.trace_id},
+            )
+            delivered = False
+
+        try:
+            listen_store.record_utterance(session, uid, delivered)
+        except Exception:
+            log.warning(
+                "streaming_session.record_utterance_failed",
+                extra={"trace_id": self.trace_id},
+                exc_info=True,
+            )
+
+        await self._audit(
+            "listen_say",
+            {
+                "utterance_id": uid,
+                "client_ts": client_ts,
+                "server_ts": server_ts,
+                "delivered": delivered,
+                "text_len": text_len,
+            },
+        )
+        await self._push_message(
+            WSSaidOut(type="said", utterance_id=uid, delivered=delivered)
+        )
+
     # ── 메시지 push 유틸 ─────────────────────────────────────────────────────
 
     async def _push_message(
-        self, msg: WSTranscriptOut | WSErrorOut | WSSessionEndOut
+        self,
+        msg: WSTranscriptOut
+        | WSErrorOut
+        | WSSessionEndOut
+        | WSSaidOut
+        | WSPlayedOut
+        | WSListenerStateOut,
     ) -> None:
         """앱 WS로 JSON 전송. version_id는 pipeline에서 사용하므로 여기서 노출 안 됨."""
         if self._closed:
@@ -529,6 +733,8 @@ class StreamingSession:
                 self._reconnect_task,
                 self._watchdog_task,
                 self._keepalive_task,
+                self._listener_event_task,
+                self._played_event_task,
             )
             if task is not None and task is not asyncio.current_task()
         ]
@@ -547,6 +753,18 @@ class StreamingSession:
         # Pipeline close
         if self._pipeline is not None:
             await self._pipeline.close()
+
+        # Listen 구독 해제. best-effort.
+        if hasattr(listen_store, "unsubscribe_listener_events"):
+            with contextlib.suppress(Exception):
+                await listen_store.unsubscribe_listener_events(
+                    self.patient_principal.patient_id
+                )
+        if hasattr(listen_store, "unsubscribe_played_events"):
+            with contextlib.suppress(Exception):
+                await listen_store.unsubscribe_played_events(
+                    self.patient_principal.patient_id
+                )
 
         # 앱 WS close
         with contextlib.suppress(Exception):
