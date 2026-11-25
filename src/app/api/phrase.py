@@ -270,10 +270,10 @@ def _map_candidate_source_to_db(source: str | None) -> str:
     summary="후보 추천 (v2, mode별 shape) — accuracy-mode orchestrator (D2)",
     description=(
         "**D2 accuracy-mode**: RAG + LLM + 3-level fallback chain.\n\n"
-        "- `mode=proactive` (conf ≥ 0.98): verbatim 즉시 TTS + 선택적 LLM 제안 모달\n"
-        "- `mode=candidates` (0.90 ≤ conf < 0.98): 3후보 선택 UI\n"
-        "- `mode=single` (0.40 ≤ conf < 0.90): 단일 후보 큰 글자 UI\n"
-        "- `mode=retry` (conf < 0.40): 재질의 안내 (200 OK, HTTP 400/422 아님)\n\n"
+        "- `mode=proactive` (conf ≥ 0.575): verbatim 즉시 TTS + 선택적 LLM 제안 모달\n"
+        "- `mode=candidates` (0.485 ≤ conf < 0.575): 3후보 선택 UI\n"
+        "- `mode=single` (0.290 < conf < 0.485): 단일 후보 큰 글자 UI\n"
+        "- `mode=retry` (conf ≤ 0.290): 재질의 안내 (200 OK, HTTP 400/422 아님)\n\n"
         "프론트엔드는 `mode` 필드로 switch 분기.\n\n"
         "**trace_id 규칙**: 응답 `trace_id`는 (1) 요청 body의 `trace_id`가 있으면 그 값, "
         "없으면 (2) `X-Trace-Id` 헤더 값을 그대로 돌려준다. body·header 둘 다 없으면 "

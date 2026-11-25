@@ -52,14 +52,14 @@ class VerbatimPhrase(BaseModel):
 
 
 class MLHeardPhrase(BaseModel):
-    """低 분기(0.40 ≤ conf < 0.90) ASR이 들은 그대로. 신뢰도 낮지만 환자가
+    """低 분기(0.290 < conf < 0.485) ASR이 들은 그대로. 신뢰도 낮지만 환자가
     과거에 쓴 적 없는 새 발화라면 유일한 단서. UI는 reconstruct candidate와
     함께 선택지로 노출한다 (환자/간호사가 상황 판단).
     """
 
     text: str = Field(description="ASR final_transcript 원문. 신뢰도 낮음.")
     confidence: float = Field(
-        ge=0.0, le=1.0, description="ASR confidence (0.40~0.90)."
+        ge=0.0, le=1.0, description="ASR confidence (0.290~0.485)."
     )
     source: Literal["ml_heard"] = Field(
         default="ml_heard",
@@ -195,7 +195,7 @@ class SuggestResponseV2Base(_ZDatetime):
 # ─────────── 高 분기 ───────────
 
 class ProactiveModeResponse(SuggestResponseV2Base):
-    """高 분기 (conf ≥ 0.98) — verbatim 즉시 TTS 재생 + 선택적 모달 제안.
+    """高 분기 (conf ≥ 0.575) — verbatim 즉시 TTS 재생 + 선택적 모달 제안.
 
     verbatim은 항상 존재하며 즉시 TTS 재생. suggestion은 LLM 실패 시 null →
     모달 UI 생략, 환자는 verbatim만 받는다.
@@ -222,7 +222,7 @@ class ProactiveModeResponse(SuggestResponseV2Base):
 # ─────────── 中 분기 ───────────
 
 class CandidatesModeResponse(SuggestResponseV2Base):
-    """中 분기 (0.90 ≤ conf < 0.98) — 3후보 (verbatim 1 + AI 추론 2).
+    """中 분기 (0.485 ≤ conf < 0.575) — 3후보 (verbatim 1 + AI 추론 2).
 
     candidates[0].source == asr_verbatim (rank 1, verbatim 그대로).
     candidates[1~2].source == llm_inference (rank 2·3), fallback 시 ranker_fallback.
@@ -247,7 +247,7 @@ class CandidatesModeResponse(SuggestResponseV2Base):
 # ─────────── 低 분기 ───────────
 
 class SingleModeResponse(SuggestResponseV2Base):
-    """低 분기 (0.40 ≤ conf < 0.90) — AI 단일 후보 + ASR 들린 그대로.
+    """低 분기 (0.290 < conf < 0.485) — AI 단일 후보 + ASR 들린 그대로.
 
     프론트는 2개 선택지로 렌더링: ml_heard(들린 거) / candidate(복원 추천).
     구음장애 환자는 ASR 신뢰도가 늘 낮으므로 verbatim을 완전히 버리면 과거에
@@ -278,7 +278,7 @@ class SingleModeResponse(SuggestResponseV2Base):
 # ─────────── retry 분기 ───────────
 
 class RetryModeResponse(SuggestResponseV2Base):
-    """retry 분기 (conf < 0.40) — 재질의 안내.
+    """retry 분기 (conf ≤ 0.290) — 재질의 안내.
 
     기존에는 HTTP 422 ASR_LOW_CONFIDENCE를 반환했으나 accuracy-mode에서는
     200 + RetryModeResponse로 항상 응답을 보장한다.

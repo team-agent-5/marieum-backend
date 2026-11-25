@@ -162,7 +162,7 @@ async def _handle_high(
     now: datetime,
     t0: float,
 ) -> ProactiveModeResponse:
-    """高 분기 (conf ≥ 0.98) — proactive 1개 제안."""
+    """高 분기 (conf ≥ 0.575) — proactive 1개 제안."""
     # 1. RAG retrieve
     try:
         retrieved = await retrieve_for_high(
@@ -256,7 +256,7 @@ async def _handle_mid(
     now: datetime,
     t0: float,
 ) -> CandidatesModeResponse:
-    """中 분기 (0.90 ≤ conf < 0.98) — 3후보 (verbatim + AI 2개)."""
+    """中 분기 (0.485 ≤ conf < 0.575) — 3후보 (verbatim + AI 2개)."""
     # 1. pre-embed ml_text (orchestrator 1회 수행)
     ml_vec: list[float] | None = None
     if ml_text:
@@ -420,7 +420,7 @@ async def _handle_low(
     t0: float,
     previous_phrase: str | None = None,
 ) -> SingleModeResponse:
-    """低 분기 (0.40 ≤ conf < 0.90) — AI 단일 후보 + ASR ml_heard.
+    """低 분기 (0.290 < conf < 0.485) — AI 단일 후보 + ASR ml_heard.
 
     ml_text는 LLM 입력엔 안 들어가지만 (구조적 블로킹 유지) 응답에는 ml_heard로 포함.
     환자가 과거에 쓴 적 없는 새 발화일 때 유일한 단서를 UI에 넘긴다.
