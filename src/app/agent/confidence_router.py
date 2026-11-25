@@ -20,11 +20,11 @@ def classify_branch(asr_confidence: float | None) -> ConfidenceBranch:
         → ``asr_confidence`` 를 전달하지 않는 레거시 경로나
           ML 서버 응답 누락 시 안전하게 verbatim-only 로 동작.
 
-    경계 처리 (ML 보고서 2026-11-01 반영):
-        * ``conf < RETRY_CONFIDENCE (0.60)``                → ``"retry"``
-        * ``RETRY_CONFIDENCE ≤ conf < LOW_UPPER (0.90)``    → ``"low"``
-        * ``LOW_UPPER ≤ conf < MID_UPPER (0.98)``           → ``"mid"``
-        * ``conf ≥ MID_UPPER (0.98)``                       → ``"high"``
+    경계 처리 (2026-11-25 재조정):
+        * ``conf ≤ RETRY_CONFIDENCE (0.290)``                → ``"retry"``
+        * ``RETRY_CONFIDENCE < conf < LOW_UPPER (0.485)``    → ``"low"``
+        * ``LOW_UPPER ≤ conf < MID_UPPER (0.575)``           → ``"mid"``
+        * ``conf ≥ MID_UPPER (0.575)``                       → ``"high"``
 
     1차 MVP 는 **안정화 밴드 없음** (D4, 리스크 R2 수용).
     경계 flapping 은 환경변수 튜닝으로 대응한다.
@@ -40,7 +40,7 @@ def classify_branch(asr_confidence: float | None) -> ConfidenceBranch:
     if asr_confidence is None or asr_confidence < 0.0:
         return "high"
 
-    if asr_confidence < settings.retry_confidence:
+    if asr_confidence <= settings.retry_confidence:
         return "retry"
     if asr_confidence < settings.low_upper:
         return "low"

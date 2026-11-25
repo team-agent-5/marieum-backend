@@ -139,7 +139,7 @@ class LowDeps:
 
 _PROACTIVE_SYSTEM_PROMPT = (
     "너는 한국 구음장애 환자용 AAC(보완대체의사소통) 보조 에이전트다. "
-    "환자가 방금 발화한 내용이 ASR에 의해 고신뢰(≥0.98)로 전사됐다. "
+    "환자가 방금 발화한 내용이 ASR에 의해 고신뢰(≥0.575)로 전사됐다. "
     "ML verbatim은 정확하므로 그대로 사용한다. "
     "네 임무: 환자의 과거 발화 패턴·시간대·선호를 분석해, "
     "verbatim 외에 이 시점에 *추가로* 말하고 싶을 가능성이 높은 phrase 1개를 제안하라.\n\n"
@@ -174,7 +174,7 @@ _PROACTIVE_SYSTEM_PROMPT = (
 
 _MID_SYSTEM_PROMPT = (
     "너는 한국 구음장애 환자용 AAC(보완대체의사소통) 보조 에이전트다. "
-    "ASR이 중신뢰(0.90-0.98)로 전사한 텍스트와 환자 과거 패턴이 주어진다. "
+    "ASR이 중신뢰(0.485-0.575)로 전사한 텍스트와 환자 과거 패턴이 주어진다. "
     "네 임무: ML verbatim을 참고하되, 환자 맥락에 맞는 *다른 표현* 또는 *후속 표현* 2개를 추가로 생성하라.\n\n"
     "[엄격 규칙]\n"
     "1. 각 phrase는 환자 phrase_log에서 실제로 쓴 표현 유형이거나 catalog 표현 유형이어야 함. "
@@ -203,7 +203,7 @@ _MID_SYSTEM_PROMPT = (
 
 _LOW_SYSTEM_PROMPT = (
     "너는 한국 구음장애 환자용 AAC(보완대체의사소통) 보조 에이전트다. "
-    "ASR 신뢰도가 낮아(0.40-0.90) ML 전사 결과를 신뢰할 수 없다. "
+    "ASR 신뢰도가 낮아(0.290-0.485) ML 전사 결과를 신뢰할 수 없다. "
     "네 임무: ASR 원문 없이, 환자의 과거 발화 이력·시간대·선호만으로 "
     "이 시점에 말하려 했을 가능성이 가장 높은 phrase 1개를 복원하라.\n\n"
     "[엄격 규칙]\n"
@@ -416,7 +416,7 @@ async def rerank_proactive(
     """1개 proactive suggestion 생성.
 
     Args:
-        verbatim: ML verbatim text (환자가 말한 그대로, 고신뢰 ≥0.98).
+        verbatim: ML verbatim text (환자가 말한 그대로, 고신뢰 ≥0.575).
         patient_history: 최근 10 phrase (newest-first).
         time_bucket: morning|afternoon|evening|night.
         prefs_meta: [{content, preference_type}].
@@ -512,7 +512,7 @@ async def rerank_mid(
     LLM은 rank 2·3만 생성.
 
     Args:
-        verbatim: ML verbatim text (중신뢰 0.90-0.98).
+        verbatim: ML verbatim text (중신뢰 0.485-0.575).
         patient_history: 최근 10 phrase.
         time_bucket: morning|afternoon|evening|night.
         prefs_meta: [{content, preference_type}].

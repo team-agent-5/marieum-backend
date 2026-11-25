@@ -32,23 +32,23 @@ class TestClassifyBranchBoundaries:
     def test_zero_is_retry(self):
         assert self._branch(0.0) == "retry"
 
-    def test_0_39_is_retry(self):
-        assert self._branch(0.39) == "retry"
+    def test_0_200_is_retry(self):
+        assert self._branch(0.200) == "retry"
 
-    def test_0_40_is_retry(self):
-        assert self._branch(0.40) == "retry"
+    def test_0_290_is_retry(self):
+        assert self._branch(0.290) == "retry"
 
-    def test_0_89_is_low(self):
-        assert self._branch(0.89) == "low"
+    def test_0_484_is_low(self):
+        assert self._branch(0.484) == "low"
 
-    def test_0_90_is_mid(self):
-        assert self._branch(0.90) == "mid"
+    def test_0_485_is_mid(self):
+        assert self._branch(0.485) == "mid"
 
-    def test_0_97_is_mid(self):
-        assert self._branch(0.97) == "mid"
+    def test_0_574_is_mid(self):
+        assert self._branch(0.574) == "mid"
 
-    def test_0_98_is_high(self):
-        assert self._branch(0.98) == "high"
+    def test_0_575_is_high(self):
+        assert self._branch(0.575) == "high"
 
     def test_1_0_is_high(self):
         assert self._branch(1.0) == "high"
